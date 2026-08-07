@@ -20,24 +20,70 @@
 //! - **Text and identity** live in a separate segment, touched only for records
 //!   that actually make the result set. This is the load-bearing split: text is
 //!   ~4x the bytes of a vector, so keeping it out of the scan means a query
-//!   reads 1.5 KB per candidate instead of ~7 KB.
+//!   reads a few bytes per candidate instead of the whole record.
 //!
 //! Writes append to a log and are folded into the slab by compaction, so a
 //! flush costs O(changed) rather than O(corpus).
+//!
+//! # Generations (crash-safe compaction)
+//!
+//! A store is one atomic pointer (`CURRENT`) plus a sequence of immutable
+//! generation directories (`gen-NNNNNNN/`), each holding a self-consistent
+//! `vectors.f32` + `rows.bin` + `meta.jsonl` + `manifest.json` quartet.
+//! Compaction builds the *next* generation entirely inside a `.staging`
+//! sibling directory, fsyncs it, renames it into place, and only then swaps
+//! `CURRENT` (itself write-tmp-fsync-rename) to point at it. Nothing ever
+//! reads from a generation until `CURRENT` names it, so a crash at any point
+//! before the final rename leaves the previous generation — and the pending
+//! log — completely untouched. The slab/meta desync the predecessor could hit
+//! (a new slab paired with old, unrelated meta) is structurally impossible
+//! here: both live in the same directory, swapped by one rename.
+//!
+//! `rows.bin` is a fixed-width, mmap'd side-table (`id_hash`, `text_off`,
+//! `text_len`, `schema_id`, `flags`) that lets scoring and schema-scope
+//! filtering happen without ever touching `meta.jsonl`. `meta.jsonl` is
+//! parsed one line at a time, only for rows that survive into the result set
+//! — that's what makes the residency property real rather than aspirational.
 
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
+use std::cell::Cell;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use crate::LastSeekError;
 
-pub const MANIFEST_VERSION: u32 = 1;
+pub const MANIFEST_VERSION: u32 = 2;
 const VECTORS_FILE: &str = "vectors.f32";
+const ROWS_FILE: &str = "rows.bin";
 const META_FILE: &str = "meta.jsonl";
 const MANIFEST_FILE: &str = "manifest.json";
 const LOG_FILE: &str = "pending.jsonl";
+const LOCK_FILE: &str = "writer.lock";
+const CURRENT_FILE: &str = "CURRENT";
+const EMBEDDER_FILE: &str = "embedder.json";
+
+/// Width in bytes of one `rows.bin` entry: `id_hash`(8) + `text_off`(8) +
+/// `text_len`(4) + `schema_id`(4) + `flags`(4) + 4 reserved.
+const ROW_WIDTH: usize = 32;
+
+/// Stable, deterministic identity hash used for shadow lookups and tie-break
+/// ordering without allocating or comparing the identity string itself.
+/// Persisted in `rows.bin`, so this must stay fixed across versions.
+pub(crate) fn id_hash(id: &str) -> u64 {
+    let mut h: u64 = 1469598103934665603; // FNV-1a offset basis
+    for b in id.as_bytes() {
+        h ^= *b as u64;
+        h = h.wrapping_mul(1099511628211); // FNV-1a prime
+    }
+    h
+}
+
+fn gen_dir_name(generation: u64) -> String {
+    format!("gen-{generation:07}")
+}
 
 /// Identity and payload for one indexed fragment. Deliberately NOT co-located
 /// with the vector slab: scoring must never page this in.
@@ -49,7 +95,8 @@ pub struct Record {
     pub fragment_key: String,
     pub text: String,
     pub mutation_id: Option<String>,
-    /// Tombstone. Kept as a row so ordinals stay stable until compaction.
+    /// Tombstone on the pending log only. Compaction drops deleted rows
+    /// entirely, so a committed row is never marked deleted.
     #[serde(default)]
     pub deleted: bool,
 }
@@ -70,10 +117,43 @@ impl Record {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Manifest {
     pub version: u32,
+    /// Generation number this manifest describes. 0 means "no committed
+    /// generation yet" and has no on-disk `gen-*` directory.
+    #[serde(default)]
+    pub generation: u64,
     pub dimensions: usize,
     pub embedder_id: String,
-    /// Rows in the slab, including tombstoned ones.
+    #[serde(default)]
+    pub embedder_is_neural: bool,
+    /// Interned schema names; a row's `schema_id` indexes into this.
+    #[serde(default)]
+    pub schemas: Vec<String>,
+    /// Rows in the slab. Compaction never writes tombstones, so this is also
+    /// the live row count.
     pub rows: usize,
+    #[serde(default)]
+    pub vectors_bytes: u64,
+    #[serde(default)]
+    pub rows_bytes: u64,
+    #[serde(default)]
+    pub meta_bytes: u64,
+}
+
+impl Default for Manifest {
+    fn default() -> Self {
+        Self {
+            version: MANIFEST_VERSION,
+            generation: 0,
+            dimensions: 0,
+            embedder_id: String::new(),
+            embedder_is_neural: false,
+            schemas: Vec::new(),
+            rows: 0,
+            vectors_bytes: 0,
+            rows_bytes: 0,
+            meta_bytes: 0,
+        }
+    }
 }
 
 /// One pending mutation, appended as a line to the log.
@@ -84,15 +164,175 @@ pub struct PendingOp {
     pub vector: Option<Vec<f32>>,
 }
 
-/// Read side: the mmap'd slab plus the metadata needed to interpret it.
+/// A `rows.bin` entry, decoded. Everything here is readable without touching
+/// `meta.jsonl`, which is what keeps scoring and schema-scope filtering off
+/// the text segment.
+#[derive(Debug, Clone, Copy)]
+pub struct RowMeta {
+    pub id_hash: u64,
+    pub text_off: u64,
+    pub text_len: u32,
+    pub schema_id: u32,
+    pub flags: u32,
+}
+
+impl RowMeta {
+    pub fn deleted(&self) -> bool {
+        self.flags & 1 != 0
+    }
+
+    fn encode(&self) -> [u8; ROW_WIDTH] {
+        let mut buf = [0u8; ROW_WIDTH];
+        buf[0..8].copy_from_slice(&self.id_hash.to_ne_bytes());
+        buf[8..16].copy_from_slice(&self.text_off.to_ne_bytes());
+        buf[16..20].copy_from_slice(&self.text_len.to_ne_bytes());
+        buf[20..24].copy_from_slice(&self.schema_id.to_ne_bytes());
+        buf[24..28].copy_from_slice(&self.flags.to_ne_bytes());
+        buf
+    }
+
+    fn decode(bytes: &[u8]) -> Self {
+        RowMeta {
+            id_hash: u64::from_ne_bytes(bytes[0..8].try_into().unwrap()),
+            text_off: u64::from_ne_bytes(bytes[8..16].try_into().unwrap()),
+            text_len: u32::from_ne_bytes(bytes[16..20].try_into().unwrap()),
+            schema_id: u32::from_ne_bytes(bytes[20..24].try_into().unwrap()),
+            flags: u32::from_ne_bytes(bytes[24..28].try_into().unwrap()),
+        }
+    }
+}
+
+/// Table-driven crash simulation for `compact()`, gated behind a cargo
+/// feature so no fault-injection code links into a default build.
+#[cfg(feature = "fault-injection")]
+pub mod fault {
+    use std::cell::Cell;
+
+    /// Every interior point of `compact()` where a crash is distinguishable
+    /// from any other: everything before `AfterStagingDirFsync` is still
+    /// invisible garbage (nothing references the staging dir yet), and
+    /// everything from `AfterCurrentRename` onward has already committed to
+    /// the new generation. Keep `ALL` in lockstep with `compact()` — the
+    /// matrix test asserts the count so a new interior step fails the build
+    /// until it gets a case.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    #[repr(u8)]
+    pub enum FaultPoint {
+        AfterStagingBuild = 0,
+        AfterStagingDirFsync = 1,
+        AfterGenerationRename = 2,
+        AfterGenerationRenameFsync = 3,
+        AfterCurrentTmpWritten = 4,
+        AfterCurrentRename = 5,
+        AfterCurrentRenameFsync = 6,
+        AfterPendingRemoved = 7,
+    }
+
+    impl FaultPoint {
+        pub const ALL: &'static [FaultPoint] = &[
+            FaultPoint::AfterStagingBuild,
+            FaultPoint::AfterStagingDirFsync,
+            FaultPoint::AfterGenerationRename,
+            FaultPoint::AfterGenerationRenameFsync,
+            FaultPoint::AfterCurrentTmpWritten,
+            FaultPoint::AfterCurrentRename,
+            FaultPoint::AfterCurrentRenameFsync,
+            FaultPoint::AfterPendingRemoved,
+        ];
+    }
+
+    thread_local! {
+        // Thread-local, not a shared global: cargo test runs each #[test] on
+        // its own thread, and compact() calls from unrelated tests must
+        // never see this test's armed fault point.
+        static ARMED: Cell<u8> = const { Cell::new(255) };
+    }
+
+    /// Arm the next `compact()` call **on this thread** to panic once it
+    /// reaches `point`.
+    pub fn arm(point: FaultPoint) {
+        ARMED.with(|a| a.set(point as u8));
+    }
+
+    pub fn disarm() {
+        ARMED.with(|a| a.set(255));
+    }
+
+    pub(crate) fn maybe_fire(point: FaultPoint) {
+        let armed = ARMED.with(|a| a.get());
+        if armed == point as u8 {
+            disarm();
+            panic!("fault-injection: simulated crash at {point:?}");
+        }
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+macro_rules! fault_point {
+    ($point:expr) => {
+        fault::maybe_fire($point)
+    };
+}
+#[cfg(not(feature = "fault-injection"))]
+macro_rules! fault_point {
+    ($point:expr) => {};
+}
+
+/// Advisory cross-process mutual exclusion for the mutating half of the API
+/// (`append`, `compact`). Held for the whole call, closing the race where a
+/// concurrent append's op could be lost by a compaction that read the log
+/// before the append landed and deleted it after.
+struct WriterLock(File);
+
+impl Drop for WriterLock {
+    fn drop(&mut self) {
+        let _ = fs2::FileExt::unlock(&self.0);
+    }
+}
+
+fn lock_writer(dir: &Path) -> Result<WriterLock, LastSeekError> {
+    let f = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(dir.join(LOCK_FILE))?;
+    fs2::FileExt::lock_exclusive(&f)?;
+    Ok(WriterLock(f))
+}
+
+/// fsync a directory's own entry, so renames/creates inside it are durable.
+fn sync_dir(dir: &Path) -> Result<(), LastSeekError> {
+    File::open(dir)?.sync_all()?;
+    Ok(())
+}
+
+fn load_pending(dir: &Path) -> Result<Vec<PendingOp>, LastSeekError> {
+    match std::fs::read_to_string(dir.join(LOG_FILE)) {
+        Ok(s) => Ok(s
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            // A torn tail costs the last op, never the log.
+            .filter_map(|l| serde_json::from_str::<PendingOp>(l).ok())
+            .collect()),
+        Err(_) => Ok(Vec::new()),
+    }
+}
+
+/// Read side: the mmap'd slab plus the side-tables needed to interpret it.
 pub struct VectorStore {
     dir: PathBuf,
+    generation: u64,
     manifest: Manifest,
     /// None when the store has no committed rows yet.
     slab: Option<Mmap>,
-    meta: Vec<Record>,
+    rows_map: Option<Mmap>,
+    meta_map: Option<Mmap>,
     /// Uncommitted ops, replayed over the slab on read.
     pending: Vec<PendingOp>,
+    /// Counts calls that actually parsed a line out of `meta.jsonl`. Exists so
+    /// tests can prove residency as a deterministic count instead of an RSS
+    /// measurement.
+    meta_reads: Cell<usize>,
 }
 
 impl VectorStore {
@@ -100,51 +340,88 @@ impl VectorStore {
         let dir = dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&dir)?;
 
-        let manifest = match std::fs::read_to_string(dir.join(MANIFEST_FILE)) {
-            Ok(s) => serde_json::from_str(&s)?,
-            Err(_) => Manifest {
-                version: MANIFEST_VERSION,
-                dimensions: 0,
-                embedder_id: String::new(),
-                rows: 0,
-            },
-        };
-        if manifest.version != MANIFEST_VERSION {
-            return Err(LastSeekError::UnsupportedVersion(manifest.version));
+        // A pre-generations (v1) store has a top-level manifest.json and no
+        // CURRENT pointer. Refuse it explicitly rather than misreading it as
+        // an empty v2 store.
+        if !dir.join(CURRENT_FILE).exists() {
+            if let Ok(s) = std::fs::read_to_string(dir.join(MANIFEST_FILE)) {
+                let v: serde_json::Value = serde_json::from_str(&s)?;
+                let version = v.get("version").and_then(|x| x.as_u64()).unwrap_or(1) as u32;
+                if version != MANIFEST_VERSION {
+                    return Err(LastSeekError::UnsupportedVersion(version));
+                }
+            }
         }
 
-        let slab = match File::open(dir.join(VECTORS_FILE)) {
-            // SAFETY: the slab is only rewritten via atomic rename, so an open
-            // mapping always refers to a complete, immutable file.
-            Ok(f) => Some(unsafe { Mmap::map(&f)? }),
-            Err(_) => None,
+        let generation = match std::fs::read_to_string(dir.join(CURRENT_FILE)) {
+            Ok(s) => s.trim().parse::<u64>().unwrap_or(0),
+            Err(_) => 0,
         };
 
-        let meta = match std::fs::read_to_string(dir.join(META_FILE)) {
-            Ok(s) => s
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                .map(serde_json::from_str)
-                .collect::<Result<Vec<Record>, _>>()?,
-            Err(_) => Vec::new(),
+        let (mut manifest, slab, rows_map, meta_map) = if generation == 0 {
+            (Manifest::default(), None, None, None)
+        } else {
+            let gen_dir = dir.join(gen_dir_name(generation));
+            let manifest: Manifest =
+                serde_json::from_str(&std::fs::read_to_string(gen_dir.join(MANIFEST_FILE))?)?;
+            if manifest.version != MANIFEST_VERSION {
+                return Err(LastSeekError::UnsupportedVersion(manifest.version));
+            }
+
+            let open_checked = |name: &str, want_len: u64| -> Result<Option<Mmap>, LastSeekError> {
+                let f = File::open(gen_dir.join(name))?;
+                let len = f.metadata()?.len();
+                if len != want_len {
+                    return Err(LastSeekError::CorruptGeneration(format!(
+                        "{name} is {len} bytes, manifest for generation {} expects {want_len}",
+                        manifest.generation
+                    )));
+                }
+                if len == 0 {
+                    return Ok(None);
+                }
+                // SAFETY: generation directories are only ever written via a
+                // build-in-staging-then-rename protocol, so any file reachable
+                // through a CURRENT-named generation is complete and immutable
+                // for the lifetime of this mapping.
+                Ok(Some(unsafe { Mmap::map(&f)? }))
+            };
+
+            let slab = open_checked(VECTORS_FILE, manifest.vectors_bytes)?;
+            let rows_map = open_checked(ROWS_FILE, manifest.rows_bytes)?;
+            let meta_map = open_checked(META_FILE, manifest.meta_bytes)?;
+            (manifest, slab, rows_map, meta_map)
         };
 
-        let pending = match std::fs::read_to_string(dir.join(LOG_FILE)) {
-            Ok(s) => s
-                .lines()
-                .filter(|l| !l.trim().is_empty())
-                // A torn tail costs the last op, never the log.
-                .filter_map(|l| serde_json::from_str::<PendingOp>(l).ok())
-                .collect(),
-            Err(_) => Vec::new(),
-        };
+        // Before any generation exists, embedder identity is durable via a
+        // small sidecar so `status`/`add` agree across separate processes.
+        if generation == 0 {
+            if let Ok(s) = std::fs::read_to_string(dir.join(EMBEDDER_FILE)) {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&s) {
+                    if let Some(id) = v.get("embedder_id").and_then(|x| x.as_str()) {
+                        manifest.embedder_id = id.to_string();
+                    }
+                    if let Some(d) = v.get("dimensions").and_then(|x| x.as_u64()) {
+                        manifest.dimensions = d as usize;
+                    }
+                    if let Some(n) = v.get("embedder_is_neural").and_then(|x| x.as_bool()) {
+                        manifest.embedder_is_neural = n;
+                    }
+                }
+            }
+        }
+
+        let pending = load_pending(&dir)?;
 
         Ok(Self {
             dir,
+            generation,
             manifest,
             slab,
-            meta,
+            rows_map,
+            meta_map,
             pending,
+            meta_reads: Cell::new(0),
         })
     }
 
@@ -156,7 +433,12 @@ impl VectorStore {
         &self.manifest.embedder_id
     }
 
-    /// Committed rows in the slab, tombstones included.
+    pub fn embedder_is_neural(&self) -> bool {
+        self.manifest.embedder_is_neural
+    }
+
+    /// Committed rows in the slab. Compaction never writes tombstones, so
+    /// every committed row is live.
     pub fn committed_rows(&self) -> usize {
         self.manifest.rows
     }
@@ -169,6 +451,26 @@ impl VectorStore {
     /// pages in only what scoring actually reads.
     pub fn slab_bytes(&self) -> usize {
         self.slab.as_ref().map(|m| m.len()).unwrap_or(0)
+    }
+
+    /// Bytes the text segment occupies on disk, for residency diagnostics.
+    pub fn meta_bytes(&self) -> u64 {
+        self.manifest.meta_bytes
+    }
+
+    /// How many times a call actually parsed a `meta.jsonl` line. Resets on
+    /// reopen; exists for the residency test, not general use.
+    pub fn meta_reads(&self) -> usize {
+        self.meta_reads.get()
+    }
+
+    /// Interned id for a schema name, if any committed row uses it.
+    pub fn schema_id(&self, name: &str) -> Option<u32> {
+        self.manifest
+            .schemas
+            .iter()
+            .position(|s| s == name)
+            .map(|p| p as u32)
     }
 
     /// Borrow row `i`'s vector directly out of the mapping. No copy, no parse.
@@ -184,16 +486,43 @@ impl VectorStore {
             return None;
         }
         let bytes = &slab[start..end];
-        // SAFETY: the slab is written as native-endian f32 and the file length
-        // is validated against rows*dims*4 at open; alignment is guaranteed
-        // because mmap returns page-aligned memory and offsets are multiples
-        // of 4.
+        // SAFETY: the slab is written as native-endian f32 and the file
+        // length is validated against rows*dims*4 at open (via
+        // vectors_bytes); alignment is guaranteed because mmap returns
+        // page-aligned memory and offsets are multiples of 4.
         debug_assert_eq!(bytes.as_ptr() as usize % std::mem::align_of::<f32>(), 0);
         Some(unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const f32, d) })
     }
 
-    pub fn record_at(&self, i: usize) -> Option<&Record> {
-        self.meta.get(i)
+    /// Read row `i`'s side-table entry: identity hash, schema id, flags. Never
+    /// touches `meta.jsonl`, which is what lets scoring filter by schema and
+    /// tombstone state without paging in text.
+    pub fn row_at(&self, i: usize) -> Option<RowMeta> {
+        if i >= self.manifest.rows {
+            return None;
+        }
+        let map = self.rows_map.as_ref()?;
+        let start = i * ROW_WIDTH;
+        let end = start + ROW_WIDTH;
+        if end > map.len() {
+            return None;
+        }
+        Some(RowMeta::decode(&map[start..end]))
+    }
+
+    /// Parse row `i`'s full record out of `meta.jsonl`, using the byte range
+    /// `rows.bin` recorded for it. This is the only path that touches the
+    /// text segment, and it is O(1) — a direct offset read, not a scan.
+    pub fn record_at(&self, i: usize) -> Option<Record> {
+        let row = self.row_at(i)?;
+        let map = self.meta_map.as_ref()?;
+        let start = row.text_off as usize;
+        let end = start.checked_add(row.text_len as usize)?;
+        if end > map.len() {
+            return None;
+        }
+        self.meta_reads.set(self.meta_reads.get() + 1);
+        serde_json::from_slice(&map[start..end]).ok()
     }
 
     pub fn pending(&self) -> &[PendingOp] {
@@ -205,70 +534,165 @@ impl VectorStore {
         if ops.is_empty() {
             return Ok(());
         }
-        let mut f = BufWriter::new(
-            OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(self.dir.join(LOG_FILE))?,
-        );
-        for op in ops {
-            serde_json::to_writer(&mut f, op)?;
-            f.write_all(b"\n")?;
+        let _guard = lock_writer(&self.dir)?;
+        let f = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(self.dir.join(LOG_FILE))?;
+        {
+            let mut w = BufWriter::new(&f);
+            for op in ops {
+                serde_json::to_writer(&mut w, op)?;
+                w.write_all(b"\n")?;
+            }
+            w.flush()?;
         }
-        f.flush()?;
+        f.sync_all()?;
         self.pending.extend_from_slice(ops);
         Ok(())
     }
 
-    /// Fold pending ops into the slab and drop the log.
-    ///
-    /// Streams row by row: peak memory is one vector, not one corpus. Writes to
-    /// temporaries and renames, so a crash mid-compaction leaves the previous
-    /// generation intact and the log still replayable.
+    /// Fold pending ops into a fresh generation and swap `CURRENT` to point at
+    /// it. See the module doc for the crash-safety argument; in short: every
+    /// byte of the new generation is written, fsynced and closed inside a
+    /// `.staging` directory before anything durable references it, so a crash
+    /// at any point up to the final `CURRENT` rename leaves the previous
+    /// generation, and the pending log, entirely intact and re-compactable.
     pub fn compact(&mut self) -> Result<(), LastSeekError> {
-        if self.pending.is_empty() && self.manifest.rows == self.meta.len() {
+        #[cfg(feature = "fault-injection")]
+        use fault::FaultPoint;
+
+        let _guard = lock_writer(&self.dir)?;
+
+        // Re-read fresh under the lock: a concurrent process may have
+        // appended since this handle's last open()/compact(), and folding
+        // only what was in memory would silently drop that op when the log
+        // is removed at the end of this call.
+        let pending = load_pending(&self.dir)?;
+        if pending.is_empty() {
             return Ok(());
         }
 
-        // Last write wins per identity; the live set is committed rows updated
-        // by pending ops, minus tombstones.
-        let mut order: Vec<String> = Vec::new();
-        let mut live: std::collections::HashMap<String, (Option<usize>, Option<PendingOp>)> =
-            std::collections::HashMap::new();
-
-        for (i, rec) in self.meta.iter().enumerate() {
-            if rec.deleted {
-                continue;
+        // Safe because we hold the writer lock: no concurrent compactor could
+        // be using a staging dir left over from a prior interrupted run.
+        for entry in std::fs::read_dir(&self.dir)?.flatten() {
+            if entry.file_name().to_string_lossy().ends_with(".staging") {
+                let _ = std::fs::remove_dir_all(entry.path());
             }
+        }
+
+        // Last write wins per identity; the live set is committed rows
+        // updated by pending ops, minus deletes.
+        let mut order: Vec<String> = Vec::new();
+        let mut live: HashMap<String, (Option<usize>, Option<&PendingOp>)> = HashMap::new();
+
+        for i in 0..self.manifest.rows {
+            let rec = self.record_at(i).ok_or_else(|| {
+                LastSeekError::CorruptGeneration(format!("row {i} unreadable during compaction"))
+            })?;
             let id = rec.id();
             if live.insert(id.clone(), (Some(i), None)).is_none() {
                 order.push(id);
             }
         }
-        for op in &self.pending {
+        for op in &pending {
             let id = op.record.id();
             let entry = live.entry(id.clone()).or_insert_with(|| {
                 order.push(id.clone());
                 (None, None)
             });
-            entry.1 = Some(op.clone());
+            entry.1 = Some(op);
         }
 
-        let dims = self
-            .pending
+        let dims = pending
             .iter()
             .find_map(|op| op.vector.as_ref().map(|v| v.len()))
             .unwrap_or(self.manifest.dimensions);
 
-        let tmp_vec = self.dir.join(format!("{VECTORS_FILE}.lastseek-tmp"));
-        let tmp_meta = self.dir.join(format!("{META_FILE}.lastseek-tmp"));
-        let mut vw = BufWriter::new(File::create(&tmp_vec)?);
-        let mut mw = BufWriter::new(File::create(&tmp_meta)?);
+        let new_generation = self.generation + 1;
+        let staging = self
+            .dir
+            .join(format!("{}.staging", gen_dir_name(new_generation)));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging)?;
+        }
+
+        if let Err(e) = self.build_generation(&staging, &order, &live, dims, new_generation) {
+            let _ = std::fs::remove_dir_all(&staging);
+            return Err(e);
+        }
+        fault_point!(FaultPoint::AfterStagingBuild);
+
+        sync_dir(&staging)?;
+        fault_point!(FaultPoint::AfterStagingDirFsync);
+
+        let final_dir = self.dir.join(gen_dir_name(new_generation));
+        if final_dir.exists() {
+            std::fs::remove_dir_all(&final_dir)?;
+        }
+        std::fs::rename(&staging, &final_dir)?;
+        fault_point!(FaultPoint::AfterGenerationRename);
+        sync_dir(&self.dir)?;
+        fault_point!(FaultPoint::AfterGenerationRenameFsync);
+
+        // Drop mappings before the pointer swap so this handle never mixes
+        // an old view with the new generation once CURRENT moves.
+        self.slab = None;
+        self.rows_map = None;
+        self.meta_map = None;
+
+        let current_tmp = self.dir.join(format!("{CURRENT_FILE}.tmp"));
+        {
+            let mut f = File::create(&current_tmp)?;
+            f.write_all(new_generation.to_string().as_bytes())?;
+            f.sync_all()?;
+        }
+        fault_point!(FaultPoint::AfterCurrentTmpWritten);
+        std::fs::rename(&current_tmp, self.dir.join(CURRENT_FILE))?;
+        fault_point!(FaultPoint::AfterCurrentRename);
+        sync_dir(&self.dir)?;
+        fault_point!(FaultPoint::AfterCurrentRenameFsync);
+
+        // The generation swap is durable and every op is now represented in
+        // it. Remove the log last, so a crash before this point always
+        // leaves it fully intact and safely re-foldable.
+        let _ = std::fs::remove_file(self.dir.join(LOG_FILE));
+        fault_point!(FaultPoint::AfterPendingRemoved);
+
+        self.gc_old_generations(new_generation)?;
+
+        *self = Self::open(&self.dir)?;
+        Ok(())
+    }
+
+    /// Write one complete, self-consistent generation into `staging`. Nothing
+    /// outside `compact()` ever sees this directory before it is renamed into
+    /// its final `gen-N` name.
+    fn build_generation(
+        &self,
+        staging: &Path,
+        order: &[String],
+        live: &HashMap<String, (Option<usize>, Option<&PendingOp>)>,
+        dims: usize,
+        new_generation: u64,
+    ) -> Result<(), LastSeekError> {
+        std::fs::create_dir_all(staging)?;
+
+        let vectors_f = File::create(staging.join(VECTORS_FILE))?;
+        let rows_f = File::create(staging.join(ROWS_FILE))?;
+        let meta_f = File::create(staging.join(META_FILE))?;
+        let mut vw = BufWriter::new(&vectors_f);
+        let mut rw = BufWriter::new(&rows_f);
+        let mut mw = BufWriter::new(&meta_f);
+
+        let mut schemas: Vec<String> = Vec::new();
+        let mut schema_ids: HashMap<String, u32> = HashMap::new();
+        let mut meta_off: u64 = 0;
         let mut rows = 0usize;
 
-        for id in &order {
-            let (committed, pending) = &live[id];
-            let (record, vector): (Record, Vec<f32>) = match pending {
+        for id in order {
+            let (committed, pend) = &live[id];
+            let (record, vector): (Record, Vec<f32>) = match pend {
                 Some(op) => {
                     if op.record.deleted || op.vector.is_none() {
                         continue; // deleted: drop the row entirely
@@ -279,9 +703,18 @@ impl VectorStore {
                     let i = committed.expect("committed row without pending op");
                     let v = match self.vector_at(i) {
                         Some(v) => v.to_vec(),
-                        None => continue,
+                        None => {
+                            return Err(LastSeekError::CorruptGeneration(format!(
+                                "row {i} has metadata but no vector during compaction"
+                            )));
+                        }
                     };
-                    (self.meta[i].clone(), v)
+                    let rec = self.record_at(i).ok_or_else(|| {
+                        LastSeekError::CorruptGeneration(format!(
+                            "row {i} unreadable during compaction"
+                        ))
+                    })?;
+                    (rec, v)
                 }
             };
             if vector.len() != dims {
@@ -293,54 +726,101 @@ impl VectorStore {
             for x in &vector {
                 vw.write_all(&x.to_ne_bytes())?;
             }
-            serde_json::to_writer(&mut mw, &record)?;
+            let line = serde_json::to_vec(&record)?;
+            let schema_id = *schema_ids
+                .entry(record.schema_name.clone())
+                .or_insert_with(|| {
+                    schemas.push(record.schema_name.clone());
+                    (schemas.len() - 1) as u32
+                });
+            let row = RowMeta {
+                id_hash: id_hash(&record.id()),
+                text_off: meta_off,
+                text_len: line.len() as u32,
+                schema_id,
+                flags: 0,
+            };
+            rw.write_all(&row.encode())?;
+            mw.write_all(&line)?;
             mw.write_all(b"\n")?;
+            meta_off += line.len() as u64 + 1;
             rows += 1;
         }
+
         vw.flush()?;
+        rw.flush()?;
         mw.flush()?;
         drop(vw);
+        drop(rw);
         drop(mw);
-
-        let embedder_id = self
-            .pending
-            .iter()
-            .map(|_| self.manifest.embedder_id.clone())
-            .next()
-            .unwrap_or_else(|| self.manifest.embedder_id.clone());
-
-        // Drop the mapping before replacing the file underneath it.
-        self.slab = None;
-        std::fs::rename(&tmp_vec, self.dir.join(VECTORS_FILE))?;
-        std::fs::rename(&tmp_meta, self.dir.join(META_FILE))?;
+        vectors_f.sync_all()?;
+        rows_f.sync_all()?;
+        meta_f.sync_all()?;
+        drop(vectors_f);
+        drop(rows_f);
+        drop(meta_f);
 
         let manifest = Manifest {
             version: MANIFEST_VERSION,
+            generation: new_generation,
             dimensions: dims,
-            embedder_id,
+            embedder_id: self.manifest.embedder_id.clone(),
+            embedder_is_neural: self.manifest.embedder_is_neural,
+            schemas,
             rows,
+            vectors_bytes: (rows * dims * 4) as u64,
+            rows_bytes: (rows * ROW_WIDTH) as u64,
+            meta_bytes: meta_off,
         };
-        std::fs::write(
-            self.dir.join(MANIFEST_FILE),
-            serde_json::to_vec_pretty(&manifest)?,
-        )?;
+        let mf = File::create(staging.join(MANIFEST_FILE))?;
+        serde_json::to_writer_pretty(&mf, &manifest)?;
+        mf.sync_all()?;
 
-        // Log is folded in; remove it only after the new generation is durable.
-        let _ = std::fs::remove_file(self.dir.join(LOG_FILE));
-
-        *self = Self::open(&self.dir)?;
         Ok(())
     }
 
-    /// Record the embedder identity for a fresh store.
-    pub fn set_embedder(&mut self, id: &str, dims: usize) -> Result<(), LastSeekError> {
+    /// Remove generation directories other than `keep`. Only ever called
+    /// immediately after the pointer swap to `keep` is durable, under the
+    /// writer lock, so this can never race a reader (readers only ever open
+    /// the generation CURRENT names) or another compactor.
+    fn gc_old_generations(&self, keep: u64) -> Result<(), LastSeekError> {
+        for entry in std::fs::read_dir(&self.dir)?.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if let Some(n) = name
+                .strip_prefix("gen-")
+                .and_then(|s| s.parse::<u64>().ok())
+            {
+                if n != keep && entry.path().is_dir() {
+                    let _ = std::fs::remove_dir_all(entry.path());
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Record the embedder identity. Durable immediately via a small sidecar
+    /// (there may be no generation directory yet to carry it), and carried
+    /// forward into every future generation's manifest by `compact()`.
+    pub fn set_embedder(
+        &mut self,
+        id: &str,
+        dims: usize,
+        is_neural: bool,
+    ) -> Result<(), LastSeekError> {
         self.manifest.embedder_id = id.to_string();
+        self.manifest.embedder_is_neural = is_neural;
         if self.manifest.dimensions == 0 {
             self.manifest.dimensions = dims;
         }
+        let sidecar = serde_json::json!({
+            "embedder_id": self.manifest.embedder_id,
+            "dimensions": self.manifest.dimensions,
+            "embedder_is_neural": self.manifest.embedder_is_neural,
+        });
         std::fs::write(
-            self.dir.join(MANIFEST_FILE),
-            serde_json::to_vec_pretty(&self.manifest)?,
+            self.dir.join(EMBEDDER_FILE),
+            serde_json::to_vec_pretty(&sidecar)?,
         )?;
         Ok(())
     }

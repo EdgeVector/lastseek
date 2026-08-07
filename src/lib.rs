@@ -25,4 +25,6 @@ pub enum LastSeekError {
     DimensionMismatch { expected: usize, got: usize },
     #[error("embedder: {0}")]
     Embedder(String),
+    #[error("corrupt generation: {0}")]
+    CorruptGeneration(String),
 }

@@ -11,8 +11,16 @@
 //! where a scan is fast, an approximate index only adds recall risk and build
 //! cost. `Scorer` exists so an ANN backend can replace the pass when the corpus
 //! earns it, without moving the scope semantics.
+//!
+//! The scan itself never touches `meta.jsonl`: candidate scoring, the
+//! tombstone check and the schema-scope check all read out of `rows.bin`
+//! (`RowMeta`), which is fixed-width and mmap'd. A record's text is parsed
+//! only for rows that survive sorting into the final `k`, which is what makes
+//! the store's residency property observable from `Searcher` rather than just
+//! from `VectorStore` in isolation.
 
-use crate::store::{PendingOp, Record, VectorStore};
+use crate::store::{id_hash, PendingOp, Record, VectorStore};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
@@ -66,31 +74,43 @@ impl<'a> Searcher<'a> {
 
     /// Score `query` against the corpus and return the best `k`.
     ///
-    /// Reads vectors straight out of the mapping and touches a record's text
-    /// only for rows that survive into the result set.
+    /// Reads vectors and row metadata straight out of their mappings and
+    /// touches a record's text only for rows that survive into the result
+    /// set.
     pub fn search(&self, query: &[f32], opts: &QueryOpts) -> Vec<Hit> {
         let k = opts.k.unwrap_or(20).max(1);
         let min = opts.min_score.unwrap_or(f32::NEG_INFINITY);
         let scoped = !opts.schemas.is_empty();
+        // Committed rows whose schema isn't interned in this generation at
+        // all can never match a scoped query, so an empty set (rather than
+        // None) correctly excludes every committed row for that case.
+        let scope_ids: Option<HashSet<u32>> = scoped.then(|| {
+            opts.schemas
+                .iter()
+                .filter_map(|s| self.store.schema_id(s))
+                .collect()
+        });
 
-        // Pending ops shadow committed rows, so collect their identities first
-        // and let the pending value win.
-        let mut shadowed: std::collections::HashSet<String> = std::collections::HashSet::new();
+        // Pending ops shadow committed rows, so collect their identity
+        // hashes first and let the pending value win.
+        let mut shadowed: HashSet<u64> = HashSet::new();
         for op in self.store.pending() {
-            shadowed.insert(op.record.id());
+            shadowed.insert(id_hash(&op.record.id()));
         }
 
         let mut scored: Vec<(f32, ScoredRef)> = Vec::new();
 
         for i in 0..self.store.committed_rows() {
-            let Some(rec) = self.store.record_at(i) else {
+            let Some(row) = self.store.row_at(i) else {
                 continue;
             };
-            if rec.deleted || shadowed.contains(&rec.id()) {
+            if row.deleted() || shadowed.contains(&row.id_hash) {
                 continue;
             }
-            if scoped && !opts.schemas.iter().any(|s| s == &rec.schema_name) {
-                continue;
+            if let Some(ids) = &scope_ids {
+                if !ids.contains(&row.schema_id) {
+                    continue;
+                }
             }
             let Some(v) = self.store.vector_at(i) else {
                 continue;
@@ -125,18 +145,19 @@ impl<'a> Searcher<'a> {
             scored.push((s, ScoredRef::Pending(j)));
         }
 
-        // Deterministic order: score desc, then identity, so equal scores do
-        // not reorder between runs.
+        // Deterministic order: score desc, then identity hash, so equal
+        // scores do not reorder between runs. Compares hashes rather than
+        // strings so the sort itself never touches meta.jsonl either.
         scored.sort_by(|a, b| {
             b.0.partial_cmp(&a.0)
                 .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| self.id_of(&a.1).cmp(&self.id_of(&b.1)))
+                .then_with(|| self.id_hash_of(&a.1).cmp(&self.id_hash_of(&b.1)))
         });
 
         scored
             .into_iter()
             .filter_map(|(score, r)| {
-                let record = self.record_of(&r)?.clone();
+                let record = self.record_of(&r)?;
                 Some(Hit { score, record })
             })
             .filter(|h| match &opts.exact {
@@ -147,19 +168,27 @@ impl<'a> Searcher<'a> {
             .collect()
     }
 
-    fn record_of(&self, r: &ScoredRef) -> Option<&Record> {
+    fn record_of(&self, r: &ScoredRef) -> Option<Record> {
         match r {
             ScoredRef::Committed(i) => self.store.record_at(*i),
             ScoredRef::Pending(j) => self
                 .store
                 .pending()
                 .get(*j)
-                .map(|op: &PendingOp| &op.record),
+                .map(|op: &PendingOp| op.record.clone()),
         }
     }
 
-    fn id_of(&self, r: &ScoredRef) -> String {
-        self.record_of(r).map(|x| x.id()).unwrap_or_default()
+    fn id_hash_of(&self, r: &ScoredRef) -> u64 {
+        match r {
+            ScoredRef::Committed(i) => self.store.row_at(*i).map(|row| row.id_hash).unwrap_or(0),
+            ScoredRef::Pending(j) => self
+                .store
+                .pending()
+                .get(*j)
+                .map(|op| id_hash(&op.record.id()))
+                .unwrap_or(0),
+        }
     }
 }
 

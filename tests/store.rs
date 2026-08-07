@@ -25,7 +25,9 @@ fn rec(schema: &str, key: &str, text: &str) -> Record {
 fn seed(dir: &std::path::Path, docs: &[(&str, &str, &str)]) -> VectorStore {
     let mut emb = DeterministicEmbedder::new(DIMS);
     let mut store = VectorStore::open(dir).unwrap();
-    store.set_embedder(emb.id(), emb.dimensions()).unwrap();
+    store
+        .set_embedder(emb.id(), emb.dimensions(), emb.is_neural())
+        .unwrap();
     let texts: Vec<String> = docs.iter().map(|d| d.2.to_string()).collect();
     let vecs = emb.embed(&texts).unwrap();
     let ops: Vec<PendingOp> = docs
@@ -258,4 +260,234 @@ fn fixture_embedder_is_marked_non_neural() {
     let emb = DeterministicEmbedder::new(DIMS);
     assert!(!emb.is_neural());
     assert_ne!(emb.id(), "all-MiniLM-L6-v2");
+}
+
+#[test]
+fn embedder_identity_survives_a_reopen_before_any_compaction() {
+    // A separate `lastseek status` process must see the embedder that a
+    // prior `lastseek add` recorded, even though nothing has compacted yet
+    // and there is no generation directory to carry it.
+    let dir = tempfile::tempdir().unwrap();
+    {
+        let mut store = VectorStore::open(dir.path()).unwrap();
+        store.set_embedder("some-embedder", DIMS, true).unwrap();
+    }
+    let reopened = VectorStore::open(dir.path()).unwrap();
+    assert_eq!(reopened.embedder_id(), "some-embedder");
+    assert_eq!(reopened.dimensions(), DIMS);
+    assert!(reopened.embedder_is_neural());
+}
+
+#[test]
+fn search_touches_the_text_segment_at_most_k_times() {
+    // The residency property, made observable: scoring and schema-scope
+    // filtering must come entirely from rows.bin, so a k=5 query over a
+    // 10k-row corpus parses at most 5 meta.jsonl lines — not 10,000.
+    let dir = tempfile::tempdir().unwrap();
+    let docs: Vec<(String, String, String)> = (0..10_000)
+        .map(|i| {
+            (
+                "concept".to_string(),
+                format!("k{i}"),
+                format!("record number {i} filler text goes here"),
+            )
+        })
+        .collect();
+    let refs: Vec<(&str, &str, &str)> = docs
+        .iter()
+        .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+        .collect();
+    let mut store = seed(dir.path(), &refs);
+    store.compact().unwrap();
+    drop(store);
+
+    let reopened = VectorStore::open(dir.path()).unwrap();
+    let mut emb = DeterministicEmbedder::new(DIMS);
+    let q = emb
+        .embed(&["record number 42 filler text goes here".to_string()])
+        .unwrap()
+        .remove(0);
+    let hits = Searcher::new(&reopened).search(
+        &q,
+        &QueryOpts {
+            k: Some(5),
+            ..Default::default()
+        },
+    );
+    assert_eq!(hits.len(), 5);
+    assert!(
+        reopened.meta_reads() <= 5,
+        "open()+search(k=5) over 10k rows touched the text segment {} times; \
+         residency requires the scan to filter via rows.bin only",
+        reopened.meta_reads()
+    );
+}
+
+#[test]
+fn residency_rss_growth_is_bounded_best_effort() {
+    // Loose secondary signal only (the deterministic access-counter test
+    // above is the real gate): if `ps` is unavailable or behaves oddly on
+    // this platform, skip rather than flake.
+    fn rss_kb() -> Option<u64> {
+        let pid = std::process::id().to_string();
+        let out = std::process::Command::new("ps")
+            .args(["-o", "rss=", "-p", &pid])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        String::from_utf8(out.stdout).ok()?.trim().parse().ok()
+    }
+
+    let Some(before) = rss_kb() else {
+        return;
+    };
+
+    let dir = tempfile::tempdir().unwrap();
+    let docs: Vec<(String, String, String)> = (0..5_000)
+        .map(|i| {
+            (
+                "concept".to_string(),
+                format!("k{i}"),
+                format!(
+                    "record number {i} {}",
+                    "lorem ipsum dolor sit amet ".repeat(10)
+                ),
+            )
+        })
+        .collect();
+    let refs: Vec<(&str, &str, &str)> = docs
+        .iter()
+        .map(|(a, b, c)| (a.as_str(), b.as_str(), c.as_str()))
+        .collect();
+    let mut store = seed(dir.path(), &refs);
+    store.compact().unwrap();
+    drop(store);
+
+    let reopened = VectorStore::open(dir.path()).unwrap();
+    let meta_bytes = reopened.meta_bytes();
+    let mut emb = DeterministicEmbedder::new(DIMS);
+    let q = emb
+        .embed(&["record number 1 lorem ipsum dolor".to_string()])
+        .unwrap()
+        .remove(0);
+    let _ = Searcher::new(&reopened).search(
+        &q,
+        &QueryOpts {
+            k: Some(5),
+            ..Default::default()
+        },
+    );
+
+    let Some(after) = rss_kb() else {
+        return;
+    };
+    let growth_kb = after.saturating_sub(before);
+    let bound_kb = (meta_bytes / 1024) / 4; // 25% of meta bytes, loose signal
+                                            // Diagnostic only, never fatal: whole-process RSS also counts whatever
+                                            // sibling tests are concurrently allocating in this same test binary, so
+                                            // a bound here would flake on test-harness parallelism rather than catch
+                                            // a residency regression. search_touches_the_text_segment_at_most_k_times
+                                            // is the real (deterministic) gate for this property.
+    if growth_kb > bound_kb.max(4096) {
+        eprintln!(
+            "note: opening + querying a {meta_bytes}-byte text segment grew \
+             RSS by {growth_kb}KB (loose bound {bound_kb}KB) — likely test-binary \
+             noise from concurrently running tests, not necessarily a regression"
+        );
+    }
+}
+
+#[cfg(feature = "fault-injection")]
+mod fault_injection {
+    use lastseek::embed::{DeterministicEmbedder, Embedder};
+    use lastseek::index::{QueryOpts, Searcher};
+    use lastseek::store::fault::{self, FaultPoint};
+    use lastseek::store::{PendingOp, Record, VectorStore};
+
+    const DIMS: usize = 32;
+
+    fn rec(schema: &str, key: &str, text: &str) -> Record {
+        Record {
+            schema_name: schema.to_string(),
+            key_hash: Some(key.to_string()),
+            key_range: None,
+            fragment_key: "body".to_string(),
+            text: text.to_string(),
+            mutation_id: None,
+            deleted: false,
+        }
+    }
+
+    /// Every interior point of `compact()` must leave the store either wholly
+    /// on the previous generation or wholly on the new one, with every
+    /// identity's latest value still findable — never a slab/meta desync,
+    /// never a lost op. This is the direct regression test for the bug this
+    /// card exists to fix: a crash between the old code's two renames left a
+    /// new slab paired with old meta, so `vector_at(i)` and `record_at(i)`
+    /// described different documents.
+    #[test]
+    fn compaction_survives_a_crash_at_every_interior_point() {
+        assert_eq!(
+            FaultPoint::ALL.len(),
+            8,
+            "compact() grew a new interior step without a matching fault case"
+        );
+
+        let docs = [
+            ("concept", "a", "alpha beta"),
+            ("concept", "b", "gamma delta"),
+            ("design", "c", "epsilon zeta"),
+        ];
+
+        for &point in FaultPoint::ALL {
+            let dir = tempfile::tempdir().unwrap();
+            let mut emb = DeterministicEmbedder::new(DIMS);
+            let mut store = VectorStore::open(dir.path()).unwrap();
+            store
+                .set_embedder(emb.id(), emb.dimensions(), emb.is_neural())
+                .unwrap();
+            let texts: Vec<String> = docs.iter().map(|d| d.2.to_string()).collect();
+            let vecs = emb.embed(&texts).unwrap();
+            let ops: Vec<PendingOp> = docs
+                .iter()
+                .zip(vecs)
+                .map(|(d, v)| PendingOp {
+                    record: rec(d.0, d.1, d.2),
+                    vector: Some(v),
+                })
+                .collect();
+            store.append(&ops).unwrap();
+
+            fault::arm(point);
+            let crashed =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| store.compact())).is_err();
+            fault::disarm();
+            drop(store);
+
+            let reopened = VectorStore::open(dir.path()).unwrap();
+            let mut checker = DeterministicEmbedder::new(DIMS);
+            for d in &docs {
+                let q = checker.embed(&[d.2.to_string()]).unwrap().remove(0);
+                let hits = Searcher::new(&reopened).search(
+                    &q,
+                    &QueryOpts {
+                        exact: Some(d.2.to_string()),
+                        ..Default::default()
+                    },
+                );
+                assert_eq!(
+                    hits.len(),
+                    1,
+                    "fault at {point:?} (crashed={crashed}): identity {:?} must \
+                     appear exactly once after reopen, found {}",
+                    d,
+                    hits.len()
+                );
+                assert_eq!(hits[0].record.text, d.2);
+                assert_eq!(hits[0].record.schema_name, d.0);
+            }
+        }
+    }
 }

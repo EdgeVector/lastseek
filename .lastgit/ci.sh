@@ -19,7 +19,7 @@ test ! -d vendor/laststore
 bash -n .lastgit/ci.sh
 
 cargo fmt --all -- --check
-cargo clippy --all-targets -- -D warnings
-cargo test --release
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --release --all-features
 
 echo "lastgit ci gate PASSED"
