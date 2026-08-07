@@ -24,7 +24,9 @@ usage:
   --home DIR   store directory (default: $LASTSEEK_HOME or ~/.lastseek/index)
 
 The embedder is selected by LASTSEEK_EMBEDDER. `deterministic` is a TEST
-FIXTURE with no semantics and is refused for production stores.
+FIXTURE with no semantics and is refused for production stores. `minilm`
+loads all-MiniLM-L6-v2 from $LASTSEEK_MODEL_DIR or
+~/.lastseek/models/all-MiniLM-L6-v2 — requires a build with `--features neural`.
 ";
 
 fn home(args: &[String]) -> std::path::PathBuf {
@@ -75,19 +77,28 @@ fn flag_values(args: &[String], name: &str) -> Vec<String> {
     out
 }
 
-/// Resolve the embedder. Only the fixture exists today; the neural embedder
-/// lands behind the same trait, which is why this returns a boxed `Embedder`
-/// rather than a concrete type.
+/// Resolve the embedder. Returns a boxed `Embedder` because the concrete type
+/// depends on both the env var and, for `minilm`, whether this binary was
+/// built with `--features neural`.
 fn embedder() -> Result<Box<dyn Embedder>, LastSeekError> {
     match std::env::var("LASTSEEK_EMBEDDER").as_deref() {
         Ok("deterministic") => Ok(Box::new(DeterministicEmbedder::new(384))),
+        #[cfg(feature = "neural")]
+        Ok("minilm") => {
+            let dir = lastseek::embed::MiniLmEmbedder::default_model_dir();
+            Ok(Box::new(lastseek::embed::MiniLmEmbedder::load(&dir)?))
+        }
+        #[cfg(not(feature = "neural"))]
+        Ok("minilm") => Err(LastSeekError::Embedder(
+            "LASTSEEK_EMBEDDER=minilm requires a build with --features neural".into(),
+        )),
         Ok(other) => Err(LastSeekError::Embedder(format!(
-            "unknown embedder {other:?}; neural embedding is not wired up yet — \
-             set LASTSEEK_EMBEDDER=deterministic for fixtures"
+            "unknown embedder {other:?}; set LASTSEEK_EMBEDDER=deterministic for fixtures \
+             or LASTSEEK_EMBEDDER=minilm for neural embedding"
         ))),
         Err(_) => Err(LastSeekError::Embedder(
-            "no embedder configured; neural embedding is not wired up yet — \
-             set LASTSEEK_EMBEDDER=deterministic for fixtures"
+            "no embedder configured; set LASTSEEK_EMBEDDER=deterministic for fixtures \
+             or LASTSEEK_EMBEDDER=minilm for neural embedding"
                 .into(),
         )),
     }
