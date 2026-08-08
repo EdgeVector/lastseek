@@ -97,6 +97,7 @@ fn an_undeclared_schema_is_not_rated_and_the_partition_count_is_not_a_denominato
 
     let status = run(&[
         "status",
+        "--coverage",
         "--home",
         &home_arg,
         "--table",
@@ -180,6 +181,7 @@ fn declaring_a_live_count_makes_a_schema_tracked_and_rated() {
 
     let status = run(&[
         "status",
+        "--coverage",
         "--home",
         &home_arg,
         "--table",
@@ -251,4 +253,57 @@ fn declaring_an_unresolvable_schema_fails_loudly() {
         !counts.exists(),
         "a failed declaration must not write the file"
     );
+}
+
+/// The property that keeps a health check cheaper than the thing it checks.
+///
+/// `status` used to fetch the node's schema catalog WITH row counts on every
+/// invocation. brain's and kanban's plane client calls `lastseek status` to
+/// decide whether the plane is up, so every `brain ask` triggered a count over
+/// ~1,141 schemas. Measured with `lastdb ops`, `client=lastseek kind=schema`
+/// became the worst consumer on the primary: 244 calls, 5,519,430ms total,
+/// 194 cold shard loads per call, one call at 749,904ms.
+#[test]
+fn default_status_never_reads_the_node_catalog() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("index");
+    let home_arg = home.to_string_lossy();
+
+    // A catalog path that cannot be read. If `status` touches it at all, this
+    // fails — which is the whole point: the assertion is about the ABSENCE of
+    // a read, and a passing status here can only mean it never looked.
+    let missing = root.path().join("no-such-catalog.json");
+    let missing_arg = missing.to_string_lossy();
+
+    let status = run(&["status", "--home", &home_arg, "--catalog", &missing_arg]);
+    assert_eq!(status["ok"], true);
+    // Local facts are still reported — this is a useful status, not a stub.
+    assert!(status["embedder_id"].is_string());
+    assert!(status["committed_rows"].is_number());
+    // And it says coverage was not measured, rather than implying all-clear.
+    assert_eq!(status["state"], "unknown");
+    assert_eq!(status["coverage"]["available"], false);
+    let reason = status["coverage"]["reason"].as_str().unwrap_or("");
+    assert!(reason.contains("not requested"), "{reason}");
+    assert!(reason.contains("--coverage"), "{reason}");
+}
+
+#[test]
+fn coverage_is_reported_when_explicitly_requested() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("index");
+    let catalog = root.path().join("catalog.json");
+    std::fs::write(&catalog, r#"{"counts_included":true,"schemas":[]}"#).unwrap();
+    let home_arg = home.to_string_lossy();
+    let catalog_arg = catalog.to_string_lossy();
+
+    let status = run(&[
+        "status",
+        "--coverage",
+        "--home",
+        &home_arg,
+        "--catalog",
+        &catalog_arg,
+    ]);
+    assert_eq!(status["coverage"]["available"], true);
 }
