@@ -82,6 +82,50 @@ Ingest performs the same translation from the same table, so ingest and query
 key off one authority and agree by construction. `Record.schema_identity` holds
 that key, and never a readable name.
 
+## Coverage: the owning app declares the denominator
+
+`lastseek status` reports, per schema, vectors held against the **live** records
+that exist — and it only rates schemas whose owning app has said how many that
+is:
+
+```bash
+lastseek coverage-declare --schema Reference \
+  --live-records "$(brain list --type reference --count --json | jq -r .count)" \
+  --source 'brain list --type reference --count'
+```
+
+Two reasons it works this way, both measured.
+
+**The node catalog's `record_count` is not a denominator.** It counts rows in the
+partition, which includes every superseded version of every row. Dividing by it
+reported `Reference` at 63% when brain's own census is 1,788 and LastSeek holds
+1,788 — 100%. On `Milestone` the catalog says 415 rows for 67 milestones. The
+ratio was `live / (live + history)`, which cannot reach the floor and falls as
+the corpus ages. It is still reported, as `partition_rows`, because it is
+informative — just not a denominator.
+
+The rule: **a coverage metric must divide by a count the owning app would
+recognise as its own.** The app is the only thing that knows, because it
+dual-writes the keyed secondary that makes its corpus enumerable without a scan.
+
+**Declaring is opting in.** Without that, the floor applied to all 1,137 schemas
+on the node and produced 139 `degraded` entries dominated by machine schemas
+nobody wants searchable — `LastgitRepoPolicyEventV2` (12,633 rows),
+`LastDB Request Ops Rollup` (9,892), `RoutineRunSummary` (5,465). A signal that
+is always red is not a signal, and the thing this report exists to make visible —
+a stopped drain — goes straight back to being invisible.
+
+So `state` is one of:
+
+| | |
+|---|---|
+| `healthy` | every tracked schema is at or above the floor |
+| `degraded` | a tracked schema is below it |
+| `unknown` | nothing has declared a count, or the catalog was unreachable |
+
+`unknown` is deliberately not `healthy`: "no app declared a denominator" and
+"every schema is covered" are different facts.
+
 ## Ingest: a push feed and an app-driven backfill — no scan
 
 LastDB is Dynamo-shaped: point get, range under one hash, **no scan**. So

@@ -10,6 +10,7 @@ use lastseek::embed::{DeterministicEmbedder, Embedder};
 use lastseek::index::{QueryOpts, Searcher};
 use lastseek::ingest::Watermark;
 use lastseek::schema::{SchemaTable, AVAILABLE_PATH, DEFAULT_SCHEMA_SERVICE_URL};
+use lastseek::source_counts::SourceCounts;
 use lastseek::store::{PendingOp, Record, VectorStore};
 use lastseek::LastSeekError;
 use std::io::Read;
@@ -27,6 +28,8 @@ usage:
   lastseek doctor [--home DIR]
   lastseek schema-table [--from PATH|URL] [--table PATH]
                                       refresh the Schema Service resolution table
+  lastseek coverage-declare --schema S --live-records N [--source TEXT]
+                                      declare how many LIVE records a schema has
 
   --home DIR   store directory (default: $LASTSEEK_HOME or ~/.lastseek/index)
   --table PATH resolution table (default: $LASTSEEK_SCHEMA_TABLE or
@@ -36,6 +39,9 @@ usage:
   --lastdb-socket PATH
                LastDB Unix socket (default: $LASTSEEK_LASTDB_SOCKET,
                $LASTDB_SOCKET, or $LASTDB_HOME/data/folddb.sock)
+  --source-counts PATH
+               declared live-record counts (default: $LASTSEEK_SOURCE_COUNTS or
+               ~/.lastseek/source-counts.json)
   --coverage-floor F
                minimum vectors/source ratio for healthy (default: 0.95)
   --inbox DIR  host batch feed (default: $LASTSEEK_INBOX or
@@ -95,6 +101,12 @@ fn parse_flag<T: std::str::FromStr>(
             .map_err(|_| LastSeekError::Embedder(format!("{name} value {v:?} is not valid"))),
         None => Ok(None),
     }
+}
+
+fn source_counts_path(args: &[String]) -> std::path::PathBuf {
+    flag_value(args, "--source-counts")
+        .map(Into::into)
+        .unwrap_or_else(SourceCounts::default_path)
 }
 
 fn schema_table_path(args: &[String]) -> std::path::PathBuf {
@@ -347,6 +359,80 @@ fn run() -> Result<(), LastSeekError> {
                 }))?
             );
         }
+        "coverage-declare" => {
+            // An app declaring how many live records it owns. This is the only
+            // denominator coverage divides by, because it is the only count the
+            // owning app would recognise as its own — see src/source_counts.rs.
+            let term = flag_value(&args, "--schema").ok_or_else(|| {
+                LastSeekError::Embedder(
+                    "coverage-declare requires --schema <name|identity|registry-name>".into(),
+                )
+            })?;
+            let live = parse_flag::<u64>(&args, "--live-records")?.ok_or_else(|| {
+                LastSeekError::Embedder("coverage-declare requires --live-records N".into())
+            })?;
+            let declared_by = flag_value(&args, "--source").unwrap_or_default();
+            let at = flag_value(&args, "--at").unwrap_or_default();
+
+            // Resolve through the same table the query surface uses, so a
+            // declaration and a query naming the same schema cannot disagree.
+            // An unresolvable name is the same loud error it is everywhere else.
+            let table = load_schema_table(&args);
+            let store = VectorStore::open(&dir)?;
+            let resolved =
+                table.resolve_all(std::slice::from_ref(&term), store.interned_schemas())?;
+
+            let path = source_counts_path(&args);
+            let mut counts = SourceCounts::load_or_default(&path);
+            // A readable name can carry several identities. Declaring the count
+            // once per identity would claim each holds the whole corpus, so the
+            // declaration goes to the identity the index actually holds rows
+            // under; ties are reported rather than guessed.
+            let row_counts = store.schema_row_counts();
+            let identities: Vec<String> = resolved
+                .iter()
+                .flat_map(|r| r.identities.iter().cloned())
+                .collect();
+            let held: Vec<&String> = identities
+                .iter()
+                .filter(|i| row_counts.get(*i).copied().unwrap_or(0) > 0)
+                .collect();
+            let targets: Vec<String> = match held.len() {
+                1 => vec![held[0].clone()],
+                0 if identities.len() == 1 => identities.clone(),
+                0 => {
+                    return Err(LastSeekError::Embedder(format!(
+                        "{term:?} resolves to {} identities and the index holds rows under none                          of them, so there is no way to tell which one owns this count; declare                          by identity hash instead: {}",
+                        identities.len(),
+                        identities.join(", ")
+                    )))
+                }
+                _ => {
+                    return Err(LastSeekError::Embedder(format!(
+                        "{term:?} resolves to {} identities and the index holds rows under {} of                          them; declare by identity hash instead: {}",
+                        identities.len(),
+                        held.len(),
+                        held.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(", ")
+                    )))
+                }
+            };
+            for identity in &targets {
+                counts.declare(identity, live, &declared_by, &at);
+            }
+            counts.save(&path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "schema": term,
+                    "identities": targets,
+                    "live_records": live,
+                    "source": declared_by,
+                    "declared": counts.len(),
+                    "path": path.to_string_lossy(),
+                }))?
+            );
+        }
         "status" | "doctor" => {
             let table = load_schema_table(&args);
             let table_path = schema_table_path(&args);
@@ -357,6 +443,8 @@ fn run() -> Result<(), LastSeekError> {
                     "--coverage-floor must be between 0 and 1, got {coverage_floor}"
                 )));
             }
+            let counts_path = source_counts_path(&args);
+            let declared_counts = SourceCounts::load_or_default(&counts_path);
             match VectorStore::open(&dir) {
                 Ok(store) => {
                     // Schemas the index holds that the Schema Service table
@@ -375,13 +463,18 @@ fn run() -> Result<(), LastSeekError> {
                             source,
                             &table,
                             &store.schema_row_counts(),
+                            &declared_counts,
                             coverage_floor,
                         )
                     });
+                    // A catalog we could not reach is not evidence of a
+                    // shortfall. Reporting `degraded` for it made the field
+                    // unusable as an alert, which is the same failure as a
+                    // permanently-red floor.
                     let state = coverage
                         .as_ref()
                         .map(CoverageReport::state)
-                        .unwrap_or("degraded");
+                        .unwrap_or("unknown");
                     let coverage_json = match coverage {
                         Ok(report) => serde_json::to_value(report)?,
                         Err(error) => serde_json::json!({

@@ -12,6 +12,7 @@ pub mod embed;
 pub mod index;
 pub mod ingest;
 pub mod schema;
+pub mod source_counts;
 pub mod store;
 
 use thiserror::Error;
