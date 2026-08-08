@@ -1,0 +1,56 @@
+[package]
+name = "fastembed"
+version = "4.9.0"
+edition = "2021"
+description = "Library for generating vector embeddings, reranking locally."
+license = "Apache-2.0"
+authors = [
+  "Anush008 <anushshetty90@gmail.com>",
+  "Josh Niemelä <josh@jniemela.dk>",
+  "GrisiaEvy <a115020115@gmail.com>",
+  "George MacKerron <georgemackerron@neon.tech>",
+  "Timon Vonk <mail@timonv.nl>",
+  "Luya Wang <luya.wang@qq.com>",
+  "Tri <tri@triandco.com>",
+  "Denny Wong <denwong47@hotmail.com>",
+  "Alex Rozgo <alex.rozgo@gmail.com>",
+]
+documentation = "https://docs.rs/fastembed"
+repository = "https://github.com/Anush008/fastembed-rs"
+homepage = "https://crates.io/crates/fastembed"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = { version = "1" }
+hf-hub = { version = "0.4.1", default-features = false, optional = true }
+image = { version = "0.25.2", optional = true }
+ndarray = { version = "0.16", default-features = false }
+ort = { version = "=2.0.0-rc.9", default-features = false, features = [
+  "ndarray",
+] }
+rayon = { version = "1.10", default-features = false }
+serde_json = { version = "1" }
+tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
+
+[features]
+default = ["ort-download-binaries", "hf-hub-native-tls"]
+
+# Vendored fold patch (schema-lambda-fastembed-image-cut): image embeddings
+# are opt-in so text-only consumers (the schema Lambda) do not compile the
+# image codec tree. Upstream fastembed gained the same gate in v5.4.0.
+image-models = ["dep:image"]
+
+hf-hub = ["dep:hf-hub", "hf-hub?/ureq"]
+hf-hub-native-tls = ["hf-hub", "hf-hub?/native-tls"]
+hf-hub-rustls-tls = ["hf-hub", "hf-hub?/rustls-tls"]
+
+ort-download-binaries = ["ort/download-binaries"]
+ort-load-dynamic = ["ort/load-dynamic"]
+
+# This feature does not change any code, but is used to limit tests if
+# the user does not have `optimum-cli` or even python installed.
+optimum-cli = []
+
+# For compatibility recommend using hf-hub-native-tls
+online = ["hf-hub-native-tls"]

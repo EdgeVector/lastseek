@@ -21,6 +21,14 @@ pub trait Embedder {
     /// False for fixtures. A production index refuses these.
     fn is_neural(&self) -> bool;
     fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, LastSeekError>;
+
+    /// Query-side embedding. Symmetric embedders (the default here) embed a
+    /// query exactly like a document. Asymmetric models — BGE among them —
+    /// override this to prepend the model's query instruction; using the
+    /// document path for queries compiles fine and degrades recall silently.
+    fn embed_query(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, LastSeekError> {
+        self.embed(texts)
+    }
 }
 
 /// Hash-based stand-in with the right shape and no semantics.
@@ -76,25 +84,31 @@ impl Embedder for DeterministicEmbedder {
     }
 }
 
-/// Full-precision `all-MiniLM-L6-v2` behind `ort` (ONNX Runtime) + `tokenizers`.
+/// `bge-small-en-v1.5` via the vendored FastEmbed crate (CLS pooling,
+/// asymmetric query/document encoding).
 ///
-/// Not vector-space compatible with the predecessor's int8
-/// `model_quantized.onnx` index — that compatibility was explicitly not
-/// required (Tom, 2026-08-07), which is what let this use full precision and
-/// start clean of the predecessor's polluted vectors instead of chasing
-/// bit-for-bit parity.
+/// Not vector-space compatible with the predecessor's `all-MiniLM-L6-v2`
+/// index — that compatibility was explicitly not required (Tom, 2026-08-07),
+/// same as the MiniLM path this replaces. 384 dimensions, so the store's slab
+/// layout and `rows.bin` design are unaffected by the swap.
 #[cfg(feature = "neural")]
-pub struct MiniLmEmbedder {
-    session: ort::session::Session,
-    tokenizer: tokenizers::Tokenizer,
+pub struct BgeSmallEmbedder {
+    model: fastembed::TextEmbedding,
 }
 
 #[cfg(feature = "neural")]
-impl MiniLmEmbedder {
-    pub const ID: &'static str = "all-MiniLM-L6-v2";
+impl BgeSmallEmbedder {
+    pub const ID: &'static str = "fastembed/bge-small-en-v1.5";
     pub const DIMENSIONS: usize = 384;
 
-    /// `~/.lastseek/models/all-MiniLM-L6-v2`, overridable via
+    /// BGE is asymmetric (Tom 2026-08-07 decision doc): queries need this
+    /// instruction prefix, documents do not. Getting this backwards compiles
+    /// and produces plausible vectors with silently degraded recall.
+    /// https://huggingface.co/BAAI/bge-small-en-v1.5
+    const QUERY_INSTRUCTION: &'static str =
+        "Represent this sentence for searching relevant passages: ";
+
+    /// `~/.lastseek/models/bge-small-en-v1.5`, overridable via
     /// `LASTSEEK_MODEL_DIR`. Never read out of another app's `node_modules`.
     pub fn default_model_dir() -> std::path::PathBuf {
         if let Ok(v) = std::env::var("LASTSEEK_MODEL_DIR") {
@@ -104,42 +118,67 @@ impl MiniLmEmbedder {
         std::path::Path::new(&base)
             .join(".lastseek")
             .join("models")
-            .join("all-MiniLM-L6-v2")
+            .join("bge-small-en-v1.5")
     }
 
-    /// Loads `model.onnx` and `tokenizer.json` from `model_dir`.
+    /// Loads `model.onnx` and the tokenizer file set from `model_dir`. See
+    /// README.md for how to obtain the weights.
     pub fn load(model_dir: impl AsRef<std::path::Path>) -> Result<Self, LastSeekError> {
         let model_dir = model_dir.as_ref();
+        let read = |name: &str| -> Result<Vec<u8>, LastSeekError> {
+            std::fs::read(model_dir.join(name)).map_err(|e| {
+                LastSeekError::Embedder(format!("loading {name} from {}: {e}", model_dir.display()))
+            })
+        };
 
-        let mut tokenizer = tokenizers::Tokenizer::from_file(model_dir.join("tokenizer.json"))
-            .map_err(|e| {
-                LastSeekError::Embedder(format!(
-                    "loading tokenizer.json from {}: {e}",
-                    model_dir.display()
-                ))
-            })?;
-        // The tokenizer.json shipped by sentence-transformers bakes in a
-        // padding strategy — the spike saw every input padded to 128 tokens,
-        // and pad tokens leak into the mean-pooled vector unless padding is
-        // turned off here. Batching stays one text at a time as a result.
-        tokenizer.with_padding(None);
+        let tokenizer_files = fastembed::TokenizerFiles {
+            tokenizer_file: read("tokenizer.json")?,
+            config_file: read("config.json")?,
+            special_tokens_map_file: read("special_tokens_map.json")?,
+            tokenizer_config_file: read("tokenizer_config.json")?,
+        };
+        // BGE uses CLS pooling, not mean pooling — MiniLM's pooling formula
+        // would silently produce plausible-but-wrong vectors here (see
+        // module doc). Full precision: QuantizationMode::None, not the `Q`
+        // (Static) variant.
+        let model = fastembed::UserDefinedEmbeddingModel::new(read("model.onnx")?, tokenizer_files)
+            .with_pooling(fastembed::Pooling::Cls)
+            .with_quantization(fastembed::QuantizationMode::None);
 
-        let session = ort::session::Session::builder()
-            .map_err(|e| LastSeekError::Embedder(format!("ort session builder: {e}")))?
-            .commit_from_file(model_dir.join("model.onnx"))
-            .map_err(|e| {
-                LastSeekError::Embedder(format!(
-                    "loading model.onnx from {}: {e}",
-                    model_dir.display()
-                ))
-            })?;
+        let model = fastembed::TextEmbedding::try_new_from_user_defined(
+            model,
+            fastembed::InitOptionsUserDefined::new(),
+        )
+        .map_err(|e| LastSeekError::Embedder(format!("loading fastembed model: {e}")))?;
 
-        Ok(Self { session, tokenizer })
+        Ok(Self { model })
+    }
+
+    fn embed_raw(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, LastSeekError> {
+        let vectors = self
+            .model
+            .embed(texts.to_vec(), None)
+            .map_err(|e| LastSeekError::Embedder(format!("fastembed inference: {e}")))?;
+        for v in &vectors {
+            if v.len() != Self::DIMENSIONS {
+                return Err(LastSeekError::DimensionMismatch {
+                    expected: Self::DIMENSIONS,
+                    got: v.len(),
+                });
+            }
+        }
+        Ok(vectors
+            .into_iter()
+            .map(|mut v| {
+                crate::index::normalize(&mut v);
+                v
+            })
+            .collect())
     }
 }
 
 #[cfg(feature = "neural")]
-impl Embedder for MiniLmEmbedder {
+impl Embedder for BgeSmallEmbedder {
     fn id(&self) -> &str {
         Self::ID
     }
@@ -153,71 +192,14 @@ impl Embedder for MiniLmEmbedder {
     }
 
     fn embed(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, LastSeekError> {
-        texts
+        self.embed_raw(texts)
+    }
+
+    fn embed_query(&mut self, texts: &[String]) -> Result<Vec<Vec<f32>>, LastSeekError> {
+        let prefixed: Vec<String> = texts
             .iter()
-            .map(|text| {
-                let encoding = self
-                    .tokenizer
-                    .encode(text.as_str(), true)
-                    .map_err(|e| LastSeekError::Embedder(format!("tokenize: {e}")))?;
-                let seq_len = encoding.len();
-                let ids: Vec<i64> = encoding.get_ids().iter().map(|&x| x as i64).collect();
-                let mask: Vec<i64> = encoding
-                    .get_attention_mask()
-                    .iter()
-                    .map(|&x| x as i64)
-                    .collect();
-                let type_ids: Vec<i64> =
-                    encoding.get_type_ids().iter().map(|&x| x as i64).collect();
-
-                let outputs = self
-                    .session
-                    .run(ort::inputs! {
-                        "input_ids" => ort::value::Tensor::from_array(([1, seq_len], ids))
-                            .map_err(|e| LastSeekError::Embedder(format!("input_ids tensor: {e}")))?,
-                        "attention_mask" => ort::value::Tensor::from_array(([1, seq_len], mask.clone()))
-                            .map_err(|e| LastSeekError::Embedder(format!("attention_mask tensor: {e}")))?,
-                        "token_type_ids" => ort::value::Tensor::from_array(([1, seq_len], type_ids))
-                            .map_err(|e| LastSeekError::Embedder(format!("token_type_ids tensor: {e}")))?,
-                    })
-                    .map_err(|e| LastSeekError::Embedder(format!("inference: {e}")))?;
-
-                let (shape, data) = outputs["last_hidden_state"]
-                    .try_extract_tensor::<f32>()
-                    .map_err(|e| LastSeekError::Embedder(format!("extract last_hidden_state: {e}")))?;
-                let hidden = *shape.last().expect("last_hidden_state has rank >= 1") as usize;
-                if hidden != Self::DIMENSIONS {
-                    return Err(LastSeekError::DimensionMismatch {
-                        expected: Self::DIMENSIONS,
-                        got: hidden,
-                    });
-                }
-
-                // Attention-mask-weighted mean pool. With padding disabled the
-                // mask is all ones and this is a plain mean, but writing it
-                // this way keeps the formula correct if a padded/batched path
-                // is ever added.
-                let mut pooled = vec![0f32; hidden];
-                let mut weight = 0f32;
-                for t in 0..seq_len {
-                    let m = mask[t] as f32;
-                    if m == 0.0 {
-                        continue;
-                    }
-                    weight += m;
-                    let row = &data[t * hidden..(t + 1) * hidden];
-                    for (p, x) in pooled.iter_mut().zip(row) {
-                        *p += x * m;
-                    }
-                }
-                if weight > 0.0 {
-                    for p in pooled.iter_mut() {
-                        *p /= weight;
-                    }
-                }
-                crate::index::normalize(&mut pooled);
-                Ok(pooled)
-            })
-            .collect()
+            .map(|t| format!("{}{t}", Self::QUERY_INSTRUCTION))
+            .collect();
+        self.embed_raw(&prefixed)
     }
 }

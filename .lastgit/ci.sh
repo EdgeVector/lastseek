@@ -18,8 +18,36 @@ test ! -d vendor/laststore
 
 bash -n .lastgit/ci.sh
 
+# The gate builds an explicit feature set, NOT --all-features.
+#
+# --all-features turns on `neural`, and that broke this gate two ways at once:
+#
+#   1. It downloads. The vendored fastembed dep enables `ort-download-binaries`,
+#      so building `neural` fetches ONNX Runtime binaries at BUILD time. The
+#      gate's own contract — stated in Cargo.toml and README — is that CI links
+#      no inference runtime and fetches no weights. --all-features contradicted
+#      the thing it was supposed to protect.
+#   2. It times out. Compiling ort + the vendored fastembed graph in release
+#      takes ~11.5 minutes on this host, against LastGit's 600000ms CI timeout.
+#      Measured: cr-msjufz3p-b283 died exactly there
+#      (papercut-pipeline-stuck-cr-lastseek-cr-msjufz3p, P0), and every future
+#      Rust CR in this repo would have died the same way.
+#
+# `neural` is proven by `tests/neural.rs` against real bge weights, which only a
+# machine that HAS the weights can run — see README. Keep it out of the required
+# gate and run it locally:
+#
+#   cargo test --release --features neural,fault-injection
+#
+# `fault-injection` stays in the gate: it is pure Rust, costs nothing, and the
+# compaction fault matrix is the durability proof.
+FEATURES=fault-injection
+
+# Guard the reason above against a well-meaning re-broadening.
+! grep -qE '^\s*cargo (clippy|test).*--all-features' .lastgit/ci.sh
+
 cargo fmt --all -- --check
-cargo clippy --all-targets --all-features -- -D warnings
-cargo test --release --all-features
+cargo clippy --all-targets --features "$FEATURES" -- -D warnings
+cargo test --release --features "$FEATURES"
 
 echo "lastgit ci gate PASSED"

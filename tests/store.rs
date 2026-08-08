@@ -36,7 +36,7 @@ impl Embedder for NamedEmbedder {
 
 fn rec(schema: &str, key: &str, text: &str) -> Record {
     Record {
-        schema_name: schema.to_string(),
+        schema_identity: schema.to_string(),
         key_hash: Some(key.to_string()),
         key_range: None,
         fragment_key: "body".to_string(),
@@ -211,7 +211,7 @@ fn schema_scope_is_structural_not_a_post_filter() {
         )
         .unwrap();
     assert_eq!(scoped.len(), 1, "scoped search must find the sop row");
-    assert_eq!(scoped[0].record.schema_name, "sop");
+    assert_eq!(scoped[0].record.schema_identity, "sop");
 }
 
 #[test]
@@ -649,7 +649,7 @@ mod fault_injection {
 
     fn rec(schema: &str, key: &str, text: &str) -> Record {
         Record {
-            schema_name: schema.to_string(),
+            schema_identity: schema.to_string(),
             key_hash: Some(key.to_string()),
             key_range: None,
             fragment_key: "body".to_string(),
@@ -726,7 +726,7 @@ mod fault_injection {
                     hits.len()
                 );
                 assert_eq!(hits[0].record.text, d.2);
-                assert_eq!(hits[0].record.schema_name, d.0);
+                assert_eq!(hits[0].record.schema_identity, d.0);
             }
         }
     }
@@ -775,4 +775,188 @@ mod fault_injection {
             fault::sync_count()
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Schema scope resolution.
+//
+// These are the assertions `papercut-search-schema-scope-by-name-returns-
+// confident-empty` names as missing. The predecessor returned `Ok(vec![])` for
+// a mistyped schema and `Ok(vec![])` for an empty one, live, on brain's and
+// kanban's own corpora. Nothing in the suite could tell the two apart, so
+// nothing failed when they became the same answer.
+// ---------------------------------------------------------------------------
+
+/// `/v1/schemas/available` shaped like the live registry: one readable name
+/// wearing two identities (as `Card` wears six), a registry `name` that differs
+/// from the identity it maps to, and a schema that is real but holds no rows.
+const AVAILABLE: &str = r#"{"schemas":[
+  {"descriptive_name":"Card","name":"card-registry-1","identity_hash":"card-ident-1"},
+  {"descriptive_name":"Card","name":"card-registry-2","identity_hash":"card-ident-2"},
+  {"descriptive_name":"Reference","name":"ref-registry","identity_hash":"ref-ident"},
+  {"descriptive_name":"Milestone","name":"ms-registry","identity_hash":"ms-ident"}
+]}"#;
+
+fn scope_table() -> lastseek::schema::SchemaTable {
+    lastseek::schema::SchemaTable::from_available_json(AVAILABLE.as_bytes(), "test").unwrap()
+}
+
+/// A corpus keyed the way ingest keys it: on identity hashes, never on readable
+/// names. `Card` rows are split across both `Card` identities on purpose.
+fn scope_store(dir: &std::path::Path) -> VectorStore {
+    let mut store = seed(
+        dir,
+        &[
+            ("card-ident-1", "a", "durable compaction vector store"),
+            ("card-ident-2", "b", "durable compaction generation swap"),
+            ("ref-ident", "c", "durable compaction reference notes"),
+        ],
+    );
+    store.compact().unwrap();
+    store
+}
+
+fn scope_query(
+    store: &VectorStore,
+    terms: &[&str],
+) -> Result<Vec<lastseek::index::Hit>, LastSeekError> {
+    let mut emb = DeterministicEmbedder::new(DIMS);
+    let q = emb
+        .embed(&["durable compaction".to_string()])
+        .unwrap()
+        .remove(0);
+    Searcher::new(store, emb.id())
+        .unwrap()
+        .with_schema_table(scope_table())
+        .search(
+            &q,
+            &QueryOpts {
+                schemas: terms.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            },
+        )
+}
+
+#[test]
+fn scoping_by_a_readable_name_finds_every_identity_wearing_it() {
+    // The live measurement this replaces: `--schema Card` returned 0 hits
+    // while the same query scoped by the interned hash returned correctly
+    // ranked results.
+    let dir = tempfile::tempdir().unwrap();
+    let store = scope_store(dir.path());
+    let hits = scope_query(&store, &["Card"]).unwrap();
+    assert_eq!(hits.len(), 2, "both Card identities must answer");
+    let mut got: Vec<&str> = hits
+        .iter()
+        .map(|h| h.record.schema_identity.as_str())
+        .collect();
+    got.sort();
+    assert_eq!(got, vec!["card-ident-1", "card-ident-2"]);
+}
+
+#[test]
+fn a_wrong_schema_name_and_an_empty_schema_are_different_observables() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = scope_store(dir.path());
+
+    // Real schema, no rows in this corpus: an honest empty answer.
+    let empty = scope_query(&store, &["Milestone"]).unwrap();
+    assert!(empty.is_empty(), "Milestone holds no rows here");
+
+    // Not a schema at all: an error naming what is known. This is the whole
+    // defect — before this, both of these were `Ok(vec![])`.
+    match scope_query(&store, &["Crad"]) {
+        Err(LastSeekError::UnknownSchema { name, known }) => {
+            assert_eq!(name, "Crad");
+            assert!(!known.is_empty(), "the error must say what IS known");
+        }
+        other => panic!("expected UnknownSchema, got {other:?}"),
+    }
+}
+
+#[test]
+fn scoping_by_a_registry_name_resolves_through_to_the_identity() {
+    // A caller holding the registry `name` (what the host's IndexChangeBatch
+    // files carry) must reach the rows, which are keyed on the identity hash.
+    let dir = tempfile::tempdir().unwrap();
+    let store = scope_store(dir.path());
+    let hits = scope_query(&store, &["card-registry-2"]).unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].record.schema_identity, "card-ident-2");
+}
+
+#[test]
+fn scoping_by_an_identity_hash_still_works_without_any_table() {
+    // No table at all: hash-scoped and unscoped queries must not need one, or
+    // a missing table would take down the whole query surface.
+    let dir = tempfile::tempdir().unwrap();
+    let store = scope_store(dir.path());
+    let mut emb = DeterministicEmbedder::new(DIMS);
+    let q = emb
+        .embed(&["durable compaction".to_string()])
+        .unwrap()
+        .remove(0);
+    let hits = Searcher::new(&store, emb.id())
+        .unwrap()
+        .search(
+            &q,
+            &QueryOpts {
+                schemas: vec!["card-ident-1".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].record.schema_identity, "card-ident-1");
+}
+
+#[test]
+fn a_readable_name_without_a_table_errors_rather_than_matching_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = scope_store(dir.path());
+    let mut emb = DeterministicEmbedder::new(DIMS);
+    let q = emb
+        .embed(&["durable compaction".to_string()])
+        .unwrap()
+        .remove(0);
+    let got = Searcher::new(&store, emb.id()).unwrap().search(
+        &q,
+        &QueryOpts {
+            schemas: vec!["Card".to_string()],
+            ..Default::default()
+        },
+    );
+    // An unconfigured table is a config error, and it says so. Silently
+    // returning no hits is what made the predecessor's missing table invisible
+    // for as long as it was missing.
+    assert!(matches!(got, Err(LastSeekError::UnknownSchema { .. })));
+}
+
+#[test]
+fn an_uncompacted_row_is_reachable_by_readable_name() {
+    // Pending ops are scoped separately from committed rows. Comparing the
+    // pending record's identity key against the caller's raw term would drop
+    // every uncompacted row from a name-scoped query — a window that lasts
+    // exactly as long as the pending log does.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = scope_store(dir.path());
+    let mut emb = DeterministicEmbedder::new(DIMS);
+    let v = emb
+        .embed(&["durable compaction fresh pending row".to_string()])
+        .unwrap()
+        .remove(0);
+    store
+        .append(&[PendingOp {
+            record: rec(
+                "ms-ident",
+                "pending",
+                "durable compaction fresh pending row",
+            ),
+            vector: Some(v),
+        }])
+        .unwrap();
+
+    let hits = scope_query(&store, &["Milestone"]).unwrap();
+    assert_eq!(hits.len(), 1, "the pending Milestone row must be reachable");
+    assert_eq!(hits[0].record.schema_identity, "ms-ident");
 }

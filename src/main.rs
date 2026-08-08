@@ -7,6 +7,8 @@
 
 use lastseek::embed::{DeterministicEmbedder, Embedder};
 use lastseek::index::{QueryOpts, Searcher};
+use lastseek::ingest::Watermark;
+use lastseek::schema::{SchemaTable, AVAILABLE_PATH, DEFAULT_SCHEMA_SERVICE_URL};
 use lastseek::store::{PendingOp, Record, VectorStore};
 use lastseek::LastSeekError;
 use std::io::Read;
@@ -19,14 +21,33 @@ usage:
   lastseek query <text> [--home DIR] [--k N] [--schema S]... [--min-score F] [--exact]
   lastseek add [--home DIR]           read Records as JSONL on stdin, embed, append
   lastseek compact [--home DIR]       fold the pending log into the slab
+  lastseek drain [--home DIR] [--inbox DIR] [--max-files N] [--consume]
+                                      apply the host's IndexChangeBatch feed
   lastseek doctor [--home DIR]
+  lastseek schema-table [--from PATH|URL] [--table PATH]
+                                      refresh the Schema Service resolution table
 
   --home DIR   store directory (default: $LASTSEEK_HOME or ~/.lastseek/index)
+  --table PATH resolution table (default: $LASTSEEK_SCHEMA_TABLE or
+               ~/.lastseek/schema-table.json)
+  --inbox DIR  host batch feed (default: $LASTSEEK_INBOX or
+               $LASTDB_HOME/apps/search/inbox)
+
+`drain` is bounded (--max-files, default 2000) and reports `remaining`, because
+an unbounded drain over a large backlog is what took the machine down on
+2026-08-07. It advances a watermark instead of deleting batch files, so the
+incumbent Search app can keep reading the same inbox until cutover; --consume
+deletes them.
+
+`--schema` accepts a readable name (Card), a schema identity hash, or a
+registry name, and is resolved through the Schema Service table. A schema name
+that resolves to nothing is an ERROR, not an empty result — those are different
+answers and callers depend on telling them apart.
 
 The embedder is selected by LASTSEEK_EMBEDDER. `deterministic` is a TEST
-FIXTURE with no semantics and is refused for production stores. `minilm`
-loads all-MiniLM-L6-v2 from $LASTSEEK_MODEL_DIR or
-~/.lastseek/models/all-MiniLM-L6-v2 — requires a build with `--features neural`.
+FIXTURE with no semantics and is refused for production stores. `bge`
+loads bge-small-en-v1.5 from $LASTSEEK_MODEL_DIR or
+~/.lastseek/models/bge-small-en-v1.5 — requires a build with `--features neural`.
 ";
 
 fn home(args: &[String]) -> std::path::PathBuf {
@@ -65,6 +86,56 @@ fn parse_flag<T: std::str::FromStr>(
     }
 }
 
+fn schema_table_path(args: &[String]) -> std::path::PathBuf {
+    flag_value(args, "--table")
+        .map(Into::into)
+        .unwrap_or_else(SchemaTable::default_path)
+}
+
+/// Load the resolution table, tolerating its absence.
+///
+/// A missing table is not an error here: an unscoped query, and a query scoped
+/// by an identity hash the store already interns, both work without one. What
+/// it costs is readable-name scoping, and `resolve_all` reports that as an
+/// unknown schema naming what it does know — which is the actionable message,
+/// where refusing to start would not be.
+fn load_schema_table(args: &[String]) -> SchemaTable {
+    let path = schema_table_path(args);
+    SchemaTable::load(&path).unwrap_or_default()
+}
+
+/// Fetch the Schema Service table.
+///
+/// `src` is a local path or an `http(s)` URL. URLs are fetched by shelling out
+/// to `curl` rather than linking an HTTP client: this is one cacheable GET on a
+/// path a human can also run by hand, and the alternative measured at a rustls
+/// dependency tree and minutes of added compile time on every build of a crate
+/// whose whole point is a fast local query. A path always works, so an
+/// environment without `curl` is never stuck.
+fn fetch_schema_table(src: &str) -> Result<SchemaTable, LastSeekError> {
+    if !(src.starts_with("http://") || src.starts_with("https://")) {
+        let bytes = std::fs::read(src)?;
+        return SchemaTable::from_available_json(&bytes, src);
+    }
+    let out = std::process::Command::new("curl")
+        .args(["-sS", "--fail", "-m", "60", src])
+        .output()
+        .map_err(|e| {
+            LastSeekError::Embedder(format!(
+                "fetching {src}: {e} (no curl on PATH — pass --from with a downloaded \
+                 /v1/schemas/available body instead)"
+            ))
+        })?;
+    if !out.status.success() {
+        return Err(LastSeekError::Embedder(format!(
+            "fetching {src}: curl exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    SchemaTable::from_available_json(&out.stdout, src)
+}
+
 fn flag_values(args: &[String], name: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (i, a) in args.iter().enumerate() {
@@ -78,27 +149,27 @@ fn flag_values(args: &[String], name: &str) -> Vec<String> {
 }
 
 /// Resolve the embedder. Returns a boxed `Embedder` because the concrete type
-/// depends on both the env var and, for `minilm`, whether this binary was
+/// depends on both the env var and, for `bge`, whether this binary was
 /// built with `--features neural`.
 fn embedder() -> Result<Box<dyn Embedder>, LastSeekError> {
     match std::env::var("LASTSEEK_EMBEDDER").as_deref() {
         Ok("deterministic") => Ok(Box::new(DeterministicEmbedder::new(384))),
         #[cfg(feature = "neural")]
-        Ok("minilm") => {
-            let dir = lastseek::embed::MiniLmEmbedder::default_model_dir();
-            Ok(Box::new(lastseek::embed::MiniLmEmbedder::load(&dir)?))
+        Ok("bge") => {
+            let dir = lastseek::embed::BgeSmallEmbedder::default_model_dir();
+            Ok(Box::new(lastseek::embed::BgeSmallEmbedder::load(&dir)?))
         }
         #[cfg(not(feature = "neural"))]
-        Ok("minilm") => Err(LastSeekError::Embedder(
-            "LASTSEEK_EMBEDDER=minilm requires a build with --features neural".into(),
+        Ok("bge") => Err(LastSeekError::Embedder(
+            "LASTSEEK_EMBEDDER=bge requires a build with --features neural".into(),
         )),
         Ok(other) => Err(LastSeekError::Embedder(format!(
             "unknown embedder {other:?}; set LASTSEEK_EMBEDDER=deterministic for fixtures \
-             or LASTSEEK_EMBEDDER=minilm for neural embedding"
+             or LASTSEEK_EMBEDDER=bge for neural embedding"
         ))),
         Err(_) => Err(LastSeekError::Embedder(
             "no embedder configured; set LASTSEEK_EMBEDDER=deterministic for fixtures \
-             or LASTSEEK_EMBEDDER=minilm for neural embedding"
+             or LASTSEEK_EMBEDDER=bge for neural embedding"
                 .into(),
         )),
     }
@@ -120,9 +191,38 @@ fn run() -> Result<(), LastSeekError> {
     let dir = home(&args);
 
     match cmd.as_str() {
+        "schema-table" => {
+            let src = flag_value(&args, "--from")
+                .unwrap_or_else(|| format!("{DEFAULT_SCHEMA_SERVICE_URL}{AVAILABLE_PATH}"));
+            let path = schema_table_path(&args);
+            let table = fetch_schema_table(&src)?;
+            table.save(&path)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "source": src,
+                    "table": path.to_string_lossy(),
+                    "schemas": table.len(),
+                    "descriptive_names": table.descriptive_names(),
+                }))?
+            );
+        }
         "status" | "doctor" => {
+            let table = load_schema_table(&args);
+            let table_path = schema_table_path(&args);
             match VectorStore::open(&dir) {
                 Ok(store) => {
+                    // Schemas the index holds that the Schema Service table
+                    // cannot name. These are indexed and searchable by their
+                    // ingest key, and counted here so the gap reads as "their
+                    // owner has not published to SS" instead of as a hole
+                    // nobody can see.
+                    let ss_unknown: Vec<&String> = store
+                        .interned_schemas()
+                        .iter()
+                        .filter(|s| table.resolve(s).is_none())
+                        .collect();
                     let out = serde_json::json!({
                         "ok": true,
                         "home": dir.to_string_lossy(),
@@ -133,6 +233,16 @@ fn run() -> Result<(), LastSeekError> {
                         "pending_ops": store.pending_ops(),
                         "slab_bytes": store.slab_bytes(),
                         "log_bytes": store.log_bytes(),
+                        "schema_table": {
+                            "path": table_path.to_string_lossy(),
+                            "present": !table.is_empty(),
+                            "source": table.source,
+                            "schemas": table.len(),
+                            "descriptive_names": table.descriptive_names(),
+                        },
+                        "interned_schemas": store.interned_schemas().len(),
+                        "ss_unknown_schemas": ss_unknown.len(),
+                        "ss_unknown_sample": ss_unknown.iter().take(10).collect::<Vec<_>>(),
                     });
                     println!("{}", serde_json::to_string_pretty(&out)?);
                 }
@@ -165,21 +275,29 @@ fn run() -> Result<(), LastSeekError> {
                 return Err(LastSeekError::Embedder("query requires text".into()));
             }
             let store = VectorStore::open(&dir)?;
+            let table = load_schema_table(&args);
             let mut emb = embedder()?;
-            let q = emb.embed(std::slice::from_ref(&text))?.remove(0);
+            let q = emb.embed_query(std::slice::from_ref(&text))?.remove(0);
             let opts = QueryOpts {
                 k: parse_flag(&args, "--k")?,
                 schemas: flag_values(&args, "--schema"),
                 min_score: parse_flag(&args, "--min-score")?,
                 exact: args.iter().any(|a| a == "--exact").then_some(text),
             };
-            let hits = Searcher::new(&store, emb.id())?.search(&q, &opts)?;
+            let searcher = Searcher::new(&store, emb.id())?.with_schema_table(table.clone());
+            let hits = searcher.search(&q, &opts)?;
             let rows: Vec<_> = hits
                 .iter()
                 .map(|h| {
                     serde_json::json!({
                         "score": h.score,
-                        "schema_name": h.record.schema_name,
+                        // Both the identity the row is keyed on and the
+                        // readable label, when the table knows one. The hash
+                        // alone made every result unreadable; the label alone
+                        // would hide which of several same-named identities
+                        // actually answered.
+                        "schema_identity": h.record.schema_identity,
+                        "schema": table.label_for_identity(&h.record.schema_identity),
                         "key_hash": h.record.key_hash,
                         "key_range": h.record.key_range,
                         "fragment_key": h.record.fragment_key,
@@ -222,6 +340,113 @@ fn run() -> Result<(), LastSeekError> {
                 serde_json::to_string_pretty(&serde_json::json!({
                     "ok": true, "appended": n, "pending_ops": store.pending_ops(),
                     "log_bytes": store.log_bytes()
+                }))?
+            );
+        }
+        "drain" => {
+            let inbox = flag_value(&args, "--inbox")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(lastseek::ingest::default_inbox);
+            let max = parse_flag::<usize>(&args, "--max-files")?
+                .unwrap_or(lastseek::ingest::DEFAULT_MAX_FILES);
+            let consume = args.iter().any(|a| a == "--consume");
+            let table = load_schema_table(&args);
+            let mut mark = Watermark::load(&dir);
+            let (files, remaining) =
+                lastseek::ingest::pending_batches(&inbox, &mark.applied_through, max)?;
+
+            let mut emb = embedder()?;
+            let mut store = VectorStore::open(&dir)?;
+            store.bind_embedder(emb.as_ref())?;
+
+            let mut applied_records = 0usize;
+            let mut applied_tombstones = 0usize;
+            let mut ss_unknown_batches = 0usize;
+            let mut unreadable: Vec<String> = Vec::new();
+
+            for path in &files {
+                let name = path
+                    .file_name()
+                    .map(|n| n.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                let bytes = match std::fs::read(path) {
+                    Ok(b) => b,
+                    // A file that raced away between listing and reading is
+                    // normal while the incumbent is also draining. A file that
+                    // will not parse is reported, and the watermark still
+                    // advances past it: a single malformed batch must not wedge
+                    // the feed forever, which is how the predecessor's backlog
+                    // became unrecoverable.
+                    Err(e) => {
+                        unreadable.push(format!("{name}: {e}"));
+                        mark.applied_through = name;
+                        continue;
+                    }
+                };
+                let batch: lastseek::ingest::Batch = match serde_json::from_slice(&bytes) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        unreadable.push(format!("{name}: {e}"));
+                        mark.applied_through = name;
+                        continue;
+                    }
+                };
+                let out = batch.records(&table);
+                if out.skipped.is_some() {
+                    ss_unknown_batches += 1;
+                }
+                if !out.records.is_empty() {
+                    let texts: Vec<String> = out.records.iter().map(|r| r.text.clone()).collect();
+                    let vectors = emb.embed(&texts)?;
+                    let ops: Vec<PendingOp> = out
+                        .records
+                        .into_iter()
+                        .zip(vectors)
+                        .map(|(record, v)| PendingOp {
+                            record,
+                            vector: Some(v),
+                        })
+                        .collect();
+                    applied_records += ops.len();
+                    store.append(&ops)?;
+                }
+                if !out.tombstones.is_empty() {
+                    let ops: Vec<PendingOp> = out
+                        .tombstones
+                        .into_iter()
+                        .map(|record| PendingOp {
+                            record,
+                            vector: None,
+                        })
+                        .collect();
+                    applied_tombstones += ops.len();
+                    store.append(&ops)?;
+                }
+                mark.applied_through = name;
+                mark.files_applied += 1;
+                if consume {
+                    // Best-effort: the incumbent may already have taken it.
+                    let _ = std::fs::remove_file(path);
+                }
+            }
+            mark.save(&dir)?;
+
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "ok": true,
+                    "inbox": inbox.to_string_lossy(),
+                    "files": files.len(),
+                    // What the cap left behind. A bounded run that reports
+                    // nothing reads as "inbox empty", which is the specific
+                    // way a 99k-file backlog stayed invisible.
+                    "remaining": remaining,
+                    "records": applied_records,
+                    "tombstones": applied_tombstones,
+                    "ss_unknown_batches": ss_unknown_batches,
+                    "unreadable": unreadable,
+                    "applied_through": mark.applied_through,
+                    "pending_ops": store.pending_ops(),
                 }))?
             );
         }

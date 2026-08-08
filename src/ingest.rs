@@ -1,0 +1,465 @@
+//! Ingest — turning LastDB's index-change feed into indexable records.
+//!
+//! # There is no backfill scan, and there cannot be one
+//!
+//! LastDB is Dynamo-shaped: point get, range under one hash, **no scan**. So
+//! "page every schema to build the first index" is not a path LastSeek is
+//! allowed to have. Ingest is therefore two things, neither of which enumerates
+//! LastDB:
+//!
+//! - **Drain** (this module): the host's outbox sink writes one
+//!   `IndexChangeBatch` JSON file per mutation into
+//!   `{LASTDB_HOME}/apps/search/inbox/`. LastSeek reads that directory. It is a
+//!   push feed off the write path, which is why this crate has no LastDB client
+//!   in `Cargo.toml` — the "app on top, from the outside" boundary is literal.
+//! - **Backfill**: the owning app feeds its own corpus to `lastseek add` as
+//!   JSONL. brain and kanban can enumerate their records without a scan because
+//!   they dual-write the secondaries that make enumeration keyed. A central
+//!   backfill would have to guess, for every app forever, which fields are
+//!   prose.
+//!
+//! # Why the drain is bounded and non-destructive
+//!
+//! **Bounded** because the predecessor's was not: on 2026-08-07 an unbounded
+//! drain over a large backlog wrote 549.80 GB in twenty minutes and took the
+//! machine down. A drain here is a repeatable unit of work with a file cap that
+//! reports what it left behind. A capped run that stays silent reads as
+//! "finished", which is how that backlog reached 99k files unnoticed.
+//!
+//! **Non-destructive by default** because the incumbent Search app is still
+//! live and reads the same inbox. LastSeek advances a watermark over the batch
+//! filenames rather than deleting them; only `--consume` removes files.
+
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::schema::SchemaTable;
+use crate::store::Record;
+use crate::LastSeekError;
+
+/// Per-run file cap. See the module doc — the number matters less than the
+/// existence of a bound and a report of what was left.
+pub const DEFAULT_MAX_FILES: usize = 2000;
+
+/// Fields whose classification bars them from an index. Mirrors the host's
+/// native-index classifications, so a field the node considers secret does not
+/// become searchable prose just because it travelled through a different app.
+const BLOCKED_CLASSIFICATIONS: &[&str] = &["secret", "no_index", "no-index"];
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KeyValue {
+    #[serde(default)]
+    pub hash: Option<String>,
+    #[serde(default)]
+    pub range: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct IndexChange {
+    #[serde(default)]
+    pub mutation_id: Option<String>,
+    /// `upsert` or `tombstone`. Anything else is treated as an upsert only if
+    /// it carries fields; see `Batch::records`.
+    #[serde(default)]
+    pub kind: String,
+    pub key_value: KeyValue,
+    #[serde(default)]
+    pub fields_and_values: Option<BTreeMap<String, serde_json::Value>>,
+}
+
+/// One host-written batch.
+///
+/// `schema_name` here is the registry `name`, **not** an identity hash — that
+/// is measured, not assumed (see `crate::schema`). Translating it is the whole
+/// job of `Batch::records`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Batch {
+    pub schema_name: String,
+    #[serde(default)]
+    pub searchable_fields: Option<Vec<String>>,
+    #[serde(default)]
+    pub classifications: Option<BTreeMap<String, Vec<String>>>,
+    #[serde(default)]
+    pub changes: Vec<IndexChange>,
+}
+
+/// True when a field's classifications permit indexing.
+///
+/// No classifications means allow: the host omits them for most schemas, and
+/// defaulting to deny would empty the index. `searchable_fields`, when the batch
+/// carries it, is the narrower gate.
+fn field_is_indexable(classes: Option<&Vec<String>>) -> bool {
+    let Some(classes) = classes else {
+        return true;
+    };
+    if classes.is_empty() {
+        return true;
+    }
+    let lower: Vec<String> = classes.iter().map(|c| c.to_lowercase()).collect();
+    if lower
+        .iter()
+        .any(|c| BLOCKED_CLASSIFICATIONS.contains(&c.as_str()))
+    {
+        return false;
+    }
+    lower.iter().any(|c| c == "word")
+}
+
+/// Render a record's indexable fields as the text that gets embedded.
+///
+/// Values are joined by newline in key order. Key order — rather than the map's
+/// arrival order — because the same record re-ingested must produce the same
+/// text and therefore the same vector; an order that varies would make
+/// re-embedding produce spurious diffs.
+fn fields_to_text(
+    fields: &BTreeMap<String, serde_json::Value>,
+    searchable: Option<&Vec<String>>,
+    classifications: Option<&BTreeMap<String, Vec<String>>>,
+) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (k, v) in fields {
+        if let Some(allow) = searchable {
+            if !allow.is_empty() && !allow.contains(k) {
+                continue;
+            }
+        }
+        if !field_is_indexable(classifications.and_then(|c| c.get(k))) {
+            continue;
+        }
+        match v {
+            serde_json::Value::Null => {}
+            serde_json::Value::String(s) => parts.push(s.clone()),
+            serde_json::Value::Bool(b) => parts.push(b.to_string()),
+            serde_json::Value::Number(n) => parts.push(n.to_string()),
+            other => parts.push(other.to_string()),
+        }
+    }
+    parts.join("\n")
+}
+
+/// Why a batch produced no records. Reported rather than swallowed: a drain that
+/// silently skipped everything looks exactly like a drain with nothing to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkipReason {
+    /// The Schema Service table does not know this batch's registry `name`.
+    SchemaUnknownToSchemaService,
+}
+
+#[derive(Debug, Clone)]
+pub struct BatchRecords {
+    pub records: Vec<Record>,
+    pub tombstones: Vec<Record>,
+    pub skipped: Option<SkipReason>,
+}
+
+impl Batch {
+    /// Translate this batch into records keyed on a canonical identity.
+    ///
+    /// The registry `name` becomes the Schema Service `identity_hash`. When SS
+    /// does not know the schema, the batch is still indexed — under the registry
+    /// `name` — and reported as `SchemaUnknownToSchemaService`. Dropping it would
+    /// make "any app can search its own records" false for every app that has
+    /// not published to SS, of which there were 71 on the live node when this
+    /// was written.
+    pub fn records(&self, table: &SchemaTable) -> BatchRecords {
+        let (identity, skipped) = match table.identity_for_name(&self.schema_name) {
+            Some(id) => (id.to_string(), None),
+            None => (
+                self.schema_name.clone(),
+                Some(SkipReason::SchemaUnknownToSchemaService),
+            ),
+        };
+
+        let mut records = Vec::new();
+        let mut tombstones = Vec::new();
+        for change in &self.changes {
+            let base = Record {
+                schema_identity: identity.clone(),
+                key_hash: change.key_value.hash.clone(),
+                key_range: change.key_value.range.clone(),
+                // One vector per record. `fragment_key` exists so a future
+                // per-field or per-chunk split does not need a new identity
+                // scheme; "body" is the whole record, which is what the
+                // predecessor also wrote.
+                fragment_key: "body".to_string(),
+                text: String::new(),
+                mutation_id: change.mutation_id.clone(),
+                deleted: false,
+            };
+            if change.kind == "tombstone" {
+                tombstones.push(Record {
+                    deleted: true,
+                    ..base
+                });
+                continue;
+            }
+            let Some(fields) = change.fields_and_values.as_ref() else {
+                continue;
+            };
+            let text = fields_to_text(
+                fields,
+                self.searchable_fields.as_ref(),
+                self.classifications.as_ref(),
+            );
+            if text.trim().is_empty() {
+                // Nothing to embed. Not an error and not a skip worth
+                // reporting: a record whose only fields are numbers and ids
+                // legitimately has no prose.
+                continue;
+            }
+            records.push(Record { text, ..base });
+        }
+        BatchRecords {
+            records,
+            tombstones,
+            skipped,
+        }
+    }
+}
+
+/// How far the drain has read.
+///
+/// A watermark rather than deletion, because the incumbent Search app reads the
+/// same inbox and is still live. Batch filenames are `<epoch_ms>_<uuid>.json`,
+/// so the time prefix gives a total order that is stable across runs — and
+/// stays stable while the millisecond count is 13 digits, i.e. until 2286.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct Watermark {
+    /// Highest batch filename applied. Empty means nothing has been applied.
+    #[serde(default)]
+    pub applied_through: String,
+    #[serde(default)]
+    pub files_applied: u64,
+}
+
+impl Watermark {
+    pub fn path(home: &Path) -> PathBuf {
+        home.join("drain.watermark.json")
+    }
+
+    pub fn load(home: &Path) -> Self {
+        std::fs::read(Self::path(home))
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+            .unwrap_or_default()
+    }
+
+    pub fn save(&self, home: &Path) -> Result<(), LastSeekError> {
+        std::fs::create_dir_all(home)?;
+        let path = Self::path(home);
+        let tmp = path.with_extension("json.lastseek-tmp");
+        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        std::fs::rename(&tmp, &path)?;
+        Ok(())
+    }
+}
+
+/// Default inbox: the one the host's outbox sink already writes to.
+///
+/// Deliberately `apps/search/inbox` and not a LastSeek-specific path. The sink's
+/// path lives in fold; changing it is a fold change and a separate slice, and
+/// until then a private inbox would simply never receive anything.
+pub fn default_inbox() -> PathBuf {
+    if let Ok(v) = std::env::var("LASTSEEK_INBOX") {
+        return v.into();
+    }
+    let home = std::env::var("LASTDB_HOME")
+        .or_else(|_| std::env::var("FOLDDB_HOME"))
+        .unwrap_or_else(|_| {
+            let base = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+            format!("{base}/.lastdb")
+        });
+    Path::new(&home).join("apps").join("search").join("inbox")
+}
+
+/// Batch files strictly after `after`, in order, at most `max` of them.
+///
+/// Returns `(files, remaining)`. `remaining` is what the cap left behind, so a
+/// caller can report it instead of implying the inbox is empty.
+pub fn pending_batches(
+    inbox: &Path,
+    after: &str,
+    max: usize,
+) -> Result<(Vec<PathBuf>, usize), LastSeekError> {
+    if !inbox.is_dir() {
+        return Ok((Vec::new(), 0));
+    }
+    let mut names: Vec<String> = Vec::new();
+    for entry in std::fs::read_dir(inbox)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".json") || name.starts_with('.') {
+            continue;
+        }
+        if name.as_str() <= after {
+            continue;
+        }
+        names.push(name);
+    }
+    names.sort();
+    let total = names.len();
+    let taken = names.len().min(max);
+    let files = names
+        .into_iter()
+        .take(taken)
+        .map(|n| inbox.join(n))
+        .collect();
+    Ok((files, total - taken))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const AVAILABLE: &str = r#"{"schemas":[
+      {"descriptive_name":"Card","name":"card-registry","identity_hash":"card-ident"}
+    ]}"#;
+
+    fn table() -> SchemaTable {
+        SchemaTable::from_available_json(AVAILABLE.as_bytes(), "test").unwrap()
+    }
+
+    fn batch(json: &str) -> Batch {
+        serde_json::from_str(json).unwrap()
+    }
+
+    #[test]
+    fn a_batch_is_keyed_on_the_ss_identity_not_the_registry_name_it_arrived_with() {
+        // The translation that keeps ingest and query on the same key. Writing
+        // `schema_name` straight through is what made the predecessor's
+        // coverage read 2.7% over a working index.
+        let b = batch(
+            r#"{"schema_name":"card-registry","changes":[
+              {"mutation_id":"m1","kind":"upsert","key_value":{"hash":"slug-a","range":null},
+               "fields_and_values":{"title":"durable compaction","body":"generation swap"}}]}"#,
+        );
+        let out = b.records(&table());
+        assert_eq!(out.skipped, None);
+        assert_eq!(out.records.len(), 1);
+        assert_eq!(out.records[0].schema_identity, "card-ident");
+        assert_eq!(out.records[0].key_hash.as_deref(), Some("slug-a"));
+        // BTreeMap order: body before title.
+        assert_eq!(out.records[0].text, "generation swap\ndurable compaction");
+    }
+
+    #[test]
+    fn a_schema_the_service_does_not_know_is_indexed_and_reported_not_dropped() {
+        let b = batch(
+            r#"{"schema_name":"ops-terminal-only","changes":[
+              {"mutation_id":"m1","kind":"upsert","key_value":{"hash":"k","range":null},
+               "fields_and_values":{"note":"hello"}}]}"#,
+        );
+        let out = b.records(&table());
+        assert_eq!(out.skipped, Some(SkipReason::SchemaUnknownToSchemaService));
+        assert_eq!(out.records.len(), 1, "still indexed");
+        assert_eq!(out.records[0].schema_identity, "ops-terminal-only");
+    }
+
+    #[test]
+    fn a_tombstone_becomes_a_delete_and_carries_no_text() {
+        let b = batch(
+            r#"{"schema_name":"card-registry","changes":[
+              {"mutation_id":"m2","kind":"tombstone","key_value":{"hash":"slug-a","range":null}}]}"#,
+        );
+        let out = b.records(&table());
+        assert!(out.records.is_empty());
+        assert_eq!(out.tombstones.len(), 1);
+        assert!(out.tombstones[0].deleted);
+        assert_eq!(out.tombstones[0].schema_identity, "card-ident");
+    }
+
+    #[test]
+    fn a_secret_field_never_becomes_searchable_text() {
+        let b = batch(
+            r#"{"schema_name":"card-registry",
+                "classifications":{"token":["secret"],"title":["word"]},
+                "changes":[{"mutation_id":"m1","kind":"upsert",
+                  "key_value":{"hash":"k","range":null},
+                  "fields_and_values":{"token":"hunter2","title":"visible"}}]}"#,
+        );
+        let out = b.records(&table());
+        assert_eq!(out.records[0].text, "visible");
+    }
+
+    #[test]
+    fn searchable_fields_narrows_the_text_when_the_batch_declares_it() {
+        let b = batch(
+            r#"{"schema_name":"card-registry","searchable_fields":["title"],
+                "changes":[{"mutation_id":"m1","kind":"upsert",
+                  "key_value":{"hash":"k","range":null},
+                  "fields_and_values":{"title":"kept","body":"dropped"}}]}"#,
+        );
+        let out = b.records(&table());
+        assert_eq!(out.records[0].text, "kept");
+    }
+
+    #[test]
+    fn a_record_with_no_prose_is_skipped_without_being_an_error() {
+        let b = batch(
+            r#"{"schema_name":"card-registry","changes":[
+              {"mutation_id":"m1","kind":"upsert","key_value":{"hash":"k","range":null},
+               "fields_and_values":{"count":3,"flag":null}}]}"#,
+        );
+        // 3 renders as text, so this record IS indexable — the guard is only
+        // for records that render to nothing at all.
+        assert_eq!(b.records(&table()).records.len(), 1);
+        let empty = batch(
+            r#"{"schema_name":"card-registry","changes":[
+              {"mutation_id":"m1","kind":"upsert","key_value":{"hash":"k","range":null},
+               "fields_and_values":{"nothing":null}}]}"#,
+        );
+        assert!(empty.records(&table()).records.is_empty());
+    }
+
+    #[test]
+    fn the_drain_reads_in_filename_order_from_the_watermark_and_reports_what_it_left() {
+        let dir = tempfile::tempdir().unwrap();
+        for n in [
+            "1786150242984_a.json",
+            "1786150243083_b.json",
+            "1786150243171_c.json",
+            "notes.txt",
+            ".hidden.json",
+        ] {
+            std::fs::write(dir.path().join(n), "{}").unwrap();
+        }
+        let (files, remaining) = pending_batches(dir.path(), "", 2).unwrap();
+        assert_eq!(remaining, 1, "the cap must report the tail it skipped");
+        let names: Vec<String> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["1786150242984_a.json", "1786150243083_b.json"]);
+
+        // Resuming from the watermark picks up exactly where it stopped, and
+        // never re-applies a file — the incumbent still needs them on disk.
+        let (rest, remaining) = pending_batches(dir.path(), &names[1], 10).unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(rest.len(), 1);
+        assert!(rest[0].ends_with("1786150243171_c.json"));
+    }
+
+    #[test]
+    fn a_missing_inbox_is_an_empty_drain_not_a_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let (files, remaining) = pending_batches(&dir.path().join("nope"), "", 10).unwrap();
+        assert!(files.is_empty());
+        assert_eq!(remaining, 0);
+    }
+
+    #[test]
+    fn a_watermark_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        Watermark {
+            applied_through: "1786150243083_b.json".into(),
+            files_applied: 2,
+        }
+        .save(dir.path())
+        .unwrap();
+        let back = Watermark::load(dir.path());
+        assert_eq!(back.applied_through, "1786150243083_b.json");
+        assert_eq!(back.files_applied, 2);
+    }
+}

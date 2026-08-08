@@ -19,6 +19,7 @@
 //! the store's residency property observable from `Searcher` rather than just
 //! from `VectorStore` in isolation.
 
+use crate::schema::{ResolvedScope, SchemaTable};
 use crate::store::{id_hash, PendingOp, Record, VectorStore};
 use crate::LastSeekError;
 use std::cmp::Ordering;
@@ -33,7 +34,11 @@ pub struct Hit {
 #[derive(Debug, Clone, Default)]
 pub struct QueryOpts {
     pub k: Option<usize>,
-    /// Structural allow-list. Empty means every schema.
+    /// Structural allow-list of **caller-facing** scope terms — a readable
+    /// descriptive name (`Card`), an identity hash, or a registry `name`.
+    /// Empty means every schema. Resolution happens in `Searcher::search`
+    /// against the schema table, and an unresolvable term is an error there,
+    /// never a silently dropped filter term.
     pub schemas: Vec<String>,
     pub min_score: Option<f32>,
     /// Keep only hits whose text contains the query, case-insensitively.
@@ -67,6 +72,11 @@ pub fn normalize(v: &mut [f32]) {
 
 pub struct Searcher<'a> {
     store: &'a VectorStore,
+    /// Schema table used to resolve caller-facing scope terms. Default-empty,
+    /// which still resolves any schema the store has interned — so an
+    /// unscoped or hash-scoped query needs no table — while a readable name
+    /// requires one and says so instead of matching nothing.
+    table: SchemaTable,
 }
 
 impl<'a> Searcher<'a> {
@@ -83,7 +93,32 @@ impl<'a> Searcher<'a> {
                 embedder_id
             )));
         }
-        Ok(Self { store })
+        Ok(Self {
+            store,
+            table: SchemaTable::default(),
+        })
+    }
+
+    /// Attach the Schema Service table, which is what lets a caller scope by a
+    /// readable name.
+    pub fn with_schema_table(mut self, table: SchemaTable) -> Self {
+        self.table = table;
+        self
+    }
+
+    /// Resolve `opts.schemas` to the identity keys the index is filtered on.
+    ///
+    /// Every term must resolve — via the SS table or as a schema this store has
+    /// interned — or the whole query fails. Terms that resolve to identities
+    /// this store holds no rows for are kept: they scope to nothing and the
+    /// query legitimately returns no hits, which is the observable that must
+    /// stay distinct from an unknown name.
+    fn resolve_scope(&self, opts: &QueryOpts) -> Result<Vec<ResolvedScope>, LastSeekError> {
+        if opts.schemas.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.table
+            .resolve_all(&opts.schemas, self.store.interned_schemas())
     }
 
     /// Score `query` against the corpus and return the best `k`.
@@ -102,11 +137,21 @@ impl<'a> Searcher<'a> {
         let k = opts.k.unwrap_or(20).max(1);
         let min = opts.min_score.unwrap_or(f32::NEG_INFINITY);
         let scoped = !opts.schemas.is_empty();
-        // Committed rows whose schema isn't interned in this generation at
-        // all can never match a scoped query, so an empty set (rather than
-        // None) correctly excludes every committed row for that case.
+
+        // Resolve first, so an unresolvable scope term fails the query before
+        // any scoring happens. This replaces a `filter_map` that dropped an
+        // unresolved term from the filter set, leaving the query to report
+        // `Ok(vec![])` — indistinguishable from an empty schema.
+        let resolved = self.resolve_scope(opts)?;
+        let scope_identities: HashSet<&str> = resolved
+            .iter()
+            .flat_map(|r| r.identities.iter().map(String::as_str))
+            .collect();
+        // Identities that resolved but aren't interned in this generation
+        // simply contribute no ids: the schema is real and holds no rows here,
+        // which is a legitimate empty answer rather than a config error.
         let scope_ids: Option<HashSet<u32>> = scoped.then(|| {
-            opts.schemas
+            scope_identities
                 .iter()
                 .filter_map(|s| self.store.schema_id(s))
                 .collect()
@@ -172,7 +217,11 @@ impl<'a> Searcher<'a> {
             if v.len() != query.len() {
                 continue;
             }
-            if scoped && !opts.schemas.iter().any(|s| s == &op.record.schema_name) {
+            // Pending ops are scoped against the resolved identity set, not
+            // the raw terms: a pending row carries the identity key ingest
+            // wrote, so comparing it to a readable name would exclude every
+            // uncompacted row from a name-scoped query.
+            if scoped && !scope_identities.contains(op.record.schema_identity.as_str()) {
                 continue;
             }
             let s = dot(query, v);

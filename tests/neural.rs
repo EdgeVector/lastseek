@@ -1,26 +1,27 @@
-//! MiniLM neural-embedder tests.
+//! BGE neural-embedder tests.
 //!
 //! Gated on the `neural` feature at the file level, so a default `cargo test`
 //! (no `--features neural`) compiles this into an empty test binary that
 //! trivially passes — CI stays offline and links no inference runtime.
 //! Individually, each test also skips (rather than fails) if model weights
-//! are not present at `MiniLmEmbedder::default_model_dir()`, since CI must
+//! are not present at `BgeSmallEmbedder::default_model_dir()`, since CI must
 //! not require a network fetch of weights to stay green.
 #![cfg(feature = "neural")]
 
-use lastseek::embed::{DeterministicEmbedder, Embedder, MiniLmEmbedder};
+use lastseek::embed::{BgeSmallEmbedder, DeterministicEmbedder, Embedder};
 use lastseek::store::{PendingOp, Record, VectorStore};
 
-fn load_or_skip() -> Option<MiniLmEmbedder> {
-    let dir = MiniLmEmbedder::default_model_dir();
-    if !dir.join("model.onnx").is_file() || !dir.join("tokenizer.json").is_file() {
+fn load_or_skip() -> Option<BgeSmallEmbedder> {
+    let dir = BgeSmallEmbedder::default_model_dir();
+    let needed = ["model.onnx", "tokenizer.json", "config.json"];
+    if needed.iter().any(|f| !dir.join(f).is_file()) {
         eprintln!(
-            "skipping: no MiniLM weights at {} (set LASTSEEK_MODEL_DIR or fetch them first)",
+            "skipping: no bge-small-en-v1.5 weights at {} (set LASTSEEK_MODEL_DIR or fetch them first)",
             dir.display()
         );
         return None;
     }
-    Some(MiniLmEmbedder::load(&dir).expect("weights present but failed to load"))
+    Some(BgeSmallEmbedder::load(&dir).expect("weights present but failed to load"))
 }
 
 #[test]
@@ -42,11 +43,25 @@ fn vectors_are_the_declared_dimensionality_and_normalised() {
         .embed(&["LastDB is a Dynamo-style key-value store".to_string()])
         .unwrap()
         .remove(0);
-    assert_eq!(v.len(), MiniLmEmbedder::DIMENSIONS);
+    assert_eq!(v.len(), BgeSmallEmbedder::DIMENSIONS);
     let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
     assert!(
         (norm - 1.0).abs() < 1e-4,
         "expected a unit vector, got norm {norm}"
+    );
+}
+
+#[test]
+fn query_and_document_paths_produce_different_vectors_for_the_same_text() {
+    let Some(mut emb) = load_or_skip() else {
+        return;
+    };
+    let text = "how do I ship a new build to production".to_string();
+    let doc = emb.embed(std::slice::from_ref(&text)).unwrap().remove(0);
+    let query = emb.embed_query(&[text]).unwrap().remove(0);
+    assert_ne!(
+        doc, query,
+        "BGE is asymmetric: the query instruction prefix must change the vector"
     );
 }
 
@@ -63,7 +78,7 @@ fn round_trip_through_the_store_preserves_neural_vectors_exactly() {
     store
         .append(&[PendingOp {
             record: Record {
-                schema_name: "concept".into(),
+                schema_identity: "concept".into(),
                 key_hash: Some("a".into()),
                 key_range: None,
                 fragment_key: "body".into(),
@@ -91,7 +106,7 @@ fn a_neural_store_refuses_a_fixture_vector() {
     store
         .append(&[PendingOp {
             record: Record {
-                schema_name: "concept".into(),
+                schema_identity: "concept".into(),
                 key_hash: Some("a".into()),
                 key_range: None,
                 fragment_key: "body".into(),
