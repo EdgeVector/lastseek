@@ -26,9 +26,35 @@
 //!
 //! The owning app is the only thing that knows. It dual-writes the keyed
 //! secondary that makes its corpus enumerable without a scan — brain's
-//! type-list index, kanban's board — so `brain list --count` and
-//! `kanban list` are both cheap and, by construction, the live set. LastSeek
-//! cannot derive that for every app, and should not try.
+//! type-list index, kanban's board. LastSeek cannot derive that for every app,
+//! and should not try.
+//!
+//! ## The declared count is the app's claim, NOT a census this module vouches for
+//!
+//! An earlier version of this doc said `brain list --count` and `kanban list`
+//! are "by construction, the live set." That was wrong, and it contradicted a
+//! standing decision (Tom, 2026-08-06,
+//! `preference-brain-read-via-search-not-list-enumeration`): `brain list` "does
+//! not get a completeness contract … nothing may build a completeness-dependent
+//! sweep on it." A coverage denominator is exactly such a sweep.
+//!
+//! Two measured defects in that instrument, pulling opposite ways: the list
+//! projection under-delivers (993 of 999 reference rows), while `--count` — the
+//! half actually used — over-counts, because `delete.ts` never patches the type
+//! index, so deleted records stay countable (18 phantoms measured). The residual
+//! error therefore INFLATES the denominator, which can only make coverage look
+//! worse than it is. Biasing toward a false red rather than a false green is the
+//! survivable direction, and here it was luck rather than design.
+//!
+//! This is why `source` is not decoration. **The declaring app owns the method,
+//! and records it.** That keeps the fix local to the app when its method
+//! improves — a better access pattern changes the declaration, not this module —
+//! and it makes a stale or hand-waved denominator auditable instead of
+//! anonymous. A reader who distrusts a ratio can read the method that produced
+//! its denominator.
+//!
+//! The intended end state is a named access pattern per
+//! `design-brain-no-enumeration-match-array-retrieval`, not `list`.
 //!
 //! # Declaring is also opting in
 //!
