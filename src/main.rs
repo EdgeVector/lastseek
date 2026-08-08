@@ -5,6 +5,7 @@
 //! that stays silent reads as "finished", which is how the predecessor's inbox
 //! backlog grew to 99k unnoticed.
 
+use lastseek::coverage::{CoverageReport, DEFAULT_COVERAGE_FLOOR};
 use lastseek::embed::{DeterministicEmbedder, Embedder};
 use lastseek::index::{QueryOpts, Searcher};
 use lastseek::ingest::Watermark;
@@ -30,6 +31,13 @@ usage:
   --home DIR   store directory (default: $LASTSEEK_HOME or ~/.lastseek/index)
   --table PATH resolution table (default: $LASTSEEK_SCHEMA_TABLE or
                ~/.lastseek/schema-table.json)
+  --catalog PATH|URL
+               LastDB schema catalog fixture/URL (default: live Unix socket)
+  --lastdb-socket PATH
+               LastDB Unix socket (default: $LASTSEEK_LASTDB_SOCKET,
+               $LASTDB_SOCKET, or $LASTDB_HOME/data/folddb.sock)
+  --coverage-floor F
+               minimum vectors/source ratio for healthy (default: 0.95)
   --inbox DIR  host batch feed (default: $LASTSEEK_INBOX or
                $LASTDB_HOME/apps/search/inbox)
 
@@ -137,6 +145,92 @@ fn fetch_schema_table(src: &str) -> Result<SchemaTable, LastSeekError> {
         )));
     }
     SchemaTable::from_available_json(&out.stdout, src)
+}
+
+fn lastdb_socket(args: &[String]) -> std::path::PathBuf {
+    if let Some(path) = flag_value(args, "--lastdb-socket") {
+        return path.into();
+    }
+    if let Ok(path) = std::env::var("LASTSEEK_LASTDB_SOCKET") {
+        return path.into();
+    }
+    if let Ok(path) = std::env::var("LASTDB_SOCKET") {
+        return path.into();
+    }
+    if let Ok(home) = std::env::var("LASTDB_HOME") {
+        return std::path::Path::new(&home).join("data").join("folddb.sock");
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+    std::path::Path::new(&home)
+        .join(".lastdb")
+        .join("data")
+        .join("folddb.sock")
+}
+
+/// Read source record counts from LastDB.
+///
+/// This is the status half of LastSeek's existing LastDB relationship, not a
+/// third integration: ingest reads LastDB changes and status reads the node's
+/// catalog. The Unix socket remains the default; retired TCP is never probed.
+fn fetch_lastdb_catalog(args: &[String]) -> Result<(Vec<u8>, String), LastSeekError> {
+    if let Some(src) =
+        flag_value(args, "--catalog").or_else(|| std::env::var("LASTSEEK_LASTDB_CATALOG").ok())
+    {
+        if !(src.starts_with("http://") || src.starts_with("https://")) {
+            return Ok((std::fs::read(&src)?, src));
+        }
+        let out = std::process::Command::new("curl")
+            .args([
+                "-sS",
+                "--fail",
+                "-m",
+                "180",
+                "-H",
+                "X-LastDB-Client: lastseek",
+                &src,
+            ])
+            .output()?;
+        if out.status.success() {
+            return Ok((out.stdout, src));
+        }
+        return Err(LastSeekError::Embedder(format!(
+            "fetching LastDB catalog {src}: curl exited {:?}: {}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+
+    let socket = lastdb_socket(args);
+    let socket_text = socket.to_string_lossy().to_string();
+    let url = "http://localhost/api/schemas?include_counts=true";
+    let out = std::process::Command::new("curl")
+        .args([
+            "-sS",
+            "--fail",
+            "-m",
+            "180",
+            "-H",
+            "X-LastDB-Client: lastseek",
+            "--unix-socket",
+            &socket_text,
+            url,
+        ])
+        .output()?;
+    if !out.status.success() {
+        return Err(LastSeekError::Embedder(format!(
+            "fetching LastDB catalog over {}: curl exited {:?}: {}",
+            socket.display(),
+            out.status.code(),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )));
+    }
+    Ok((
+        out.stdout,
+        format!(
+            "unix://{}:/api/schemas?include_counts=true",
+            socket.display()
+        ),
+    ))
 }
 
 fn flag_values(args: &[String], name: &str) -> Vec<String> {
@@ -256,6 +350,13 @@ fn run() -> Result<(), LastSeekError> {
         "status" | "doctor" => {
             let table = load_schema_table(&args);
             let table_path = schema_table_path(&args);
+            let coverage_floor =
+                parse_flag::<f64>(&args, "--coverage-floor")?.unwrap_or(DEFAULT_COVERAGE_FLOOR);
+            if !(0.0..=1.0).contains(&coverage_floor) {
+                return Err(LastSeekError::Embedder(format!(
+                    "--coverage-floor must be between 0 and 1, got {coverage_floor}"
+                )));
+            }
             match VectorStore::open(&dir) {
                 Ok(store) => {
                     // Schemas the index holds that the Schema Service table
@@ -268,8 +369,31 @@ fn run() -> Result<(), LastSeekError> {
                         .iter()
                         .filter(|s| table.resolve(s).is_none())
                         .collect();
+                    let coverage = fetch_lastdb_catalog(&args).and_then(|(bytes, source)| {
+                        CoverageReport::from_catalog_json(
+                            &bytes,
+                            source,
+                            &table,
+                            &store.schema_row_counts(),
+                            coverage_floor,
+                        )
+                    });
+                    let state = coverage
+                        .as_ref()
+                        .map(CoverageReport::state)
+                        .unwrap_or("degraded");
+                    let coverage_json = match coverage {
+                        Ok(report) => serde_json::to_value(report)?,
+                        Err(error) => serde_json::json!({
+                            "available": false,
+                            "floor": coverage_floor,
+                            "error": error.to_string(),
+                            "schemas": [],
+                        }),
+                    };
                     let out = serde_json::json!({
                         "ok": true,
+                        "state": state,
                         "home": dir.to_string_lossy(),
                         "needs_rebuild": false,
                         "embedder_id": store.embedder_id(),
@@ -290,6 +414,7 @@ fn run() -> Result<(), LastSeekError> {
                         "ss_unknown_sample": ss_unknown.iter().take(10).collect::<Vec<_>>(),
                         "non_searchable_records_skipped": Watermark::load(&dir)
                             .non_searchable_records_skipped,
+                        "coverage": coverage_json,
                     });
                     println!("{}", serde_json::to_string_pretty(&out)?);
                 }

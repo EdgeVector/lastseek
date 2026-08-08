@@ -7,6 +7,7 @@
 //! The index is regenerable from LastDB at any time, which is what lets the
 //! on-disk format stay simple and unreplicated.
 
+pub mod coverage;
 pub mod embed;
 pub mod index;
 pub mod ingest;

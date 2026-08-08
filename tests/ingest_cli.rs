@@ -51,6 +51,55 @@ fn drain_and_status_expose_owner_declared_non_searchable_rows() {
     assert_eq!(drained["non_searchable_records_skipped"], 1);
     assert_eq!(drained["non_searchable_records_skipped_total"], 1);
 
-    let status = run(&["status", "--home", &home_arg]);
+    let catalog = root.path().join("catalog.json");
+    std::fs::write(&catalog, r#"{"counts_included":true,"schemas":[]}"#).unwrap();
+    let catalog_arg = catalog.to_string_lossy();
+    let status = run(&["status", "--home", &home_arg, "--catalog", &catalog_arg]);
     assert_eq!(status["non_searchable_records_skipped"], 1);
+}
+
+#[test]
+fn status_reports_source_records_without_vectors_as_degraded() {
+    let root = tempfile::tempdir().unwrap();
+    let home = root.path().join("index");
+    let available = root.path().join("available.json");
+    let table = root.path().join("schema-table.json");
+    let catalog = root.path().join("catalog.json");
+    std::fs::write(
+        &available,
+        r#"{"schemas":[{"descriptive_name":"Card","name":"card-registry","identity_hash":"card-ss"}]}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        &catalog,
+        r#"{"counts_included":true,"schemas":[{"descriptive_name":"Card","name":"card-registry","identity_hash":"node-recomputed","record_count":7}]}"#,
+    )
+    .unwrap();
+
+    let home_arg = home.to_string_lossy();
+    let available_arg = available.to_string_lossy();
+    let table_arg = table.to_string_lossy();
+    let catalog_arg = catalog.to_string_lossy();
+    run(&[
+        "schema-table",
+        "--from",
+        &available_arg,
+        "--table",
+        &table_arg,
+    ]);
+    let status = run(&[
+        "status",
+        "--home",
+        &home_arg,
+        "--table",
+        &table_arg,
+        "--catalog",
+        &catalog_arg,
+    ]);
+    assert_eq!(status["state"], "degraded");
+    assert_eq!(status["coverage"]["schemas"][0]["schema"], "Card");
+    assert_eq!(status["coverage"]["schemas"][0]["identity"], "card-ss");
+    assert_eq!(status["coverage"]["schemas"][0]["vectors_held"], 0);
+    assert_eq!(status["coverage"]["schemas"][0]["source_records"], 7);
+    assert_eq!(status["coverage"]["schemas"][0]["ratio"], 0.0);
 }

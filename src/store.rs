@@ -67,7 +67,7 @@
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -548,6 +548,43 @@ impl VectorStore {
     /// ingest saw rather than becoming unaddressable.
     pub fn interned_schemas(&self) -> &[String] {
         &self.manifest.schemas
+    }
+
+    /// Logical live vector rows per schema, including the pending overlay.
+    ///
+    /// Pending mutations shadow committed rows just as they do in search. The
+    /// newest pending mutation for one record wins, so repeated upserts do not
+    /// inflate coverage and a pending tombstone removes the committed row.
+    pub fn schema_row_counts(&self) -> BTreeMap<String, usize> {
+        let shadowed: HashSet<u64> = self
+            .pending
+            .iter()
+            .map(|op| id_hash(&op.record.id()))
+            .collect();
+        let mut counts = BTreeMap::new();
+        for i in 0..self.committed_rows() {
+            let Some(row) = self.row_at(i) else {
+                continue;
+            };
+            if row.deleted() || shadowed.contains(&row.id_hash) {
+                continue;
+            }
+            let Some(identity) = self.manifest.schemas.get(row.schema_id as usize) else {
+                continue;
+            };
+            *counts.entry(identity.clone()).or_insert(0) += 1;
+        }
+
+        let mut seen = HashSet::new();
+        for op in self.pending.iter().rev() {
+            if !seen.insert(id_hash(&op.record.id())) {
+                continue;
+            }
+            if !op.record.deleted && op.vector.is_some() {
+                *counts.entry(op.record.schema_identity.clone()).or_insert(0) += 1;
+            }
+        }
+        counts
     }
 
     /// Borrow row `i`'s vector directly out of the mapping. No copy, no parse.
