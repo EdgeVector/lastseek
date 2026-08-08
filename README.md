@@ -48,15 +48,39 @@ This is a correctness property, not an optimisation.
 
 ## Embedders
 
-Neural embedding is **not wired up yet**; `LASTSEEK_EMBEDDER=deterministic`
-selects a test fixture with no semantics, so CI can prove storage, scope and
-ranking offline without downloading weights.
+`LASTSEEK_EMBEDDER=deterministic` selects a test fixture with no semantics, so
+CI can prove storage, scope and ranking offline without downloading weights.
+`LASTSEEK_EMBEDDER=bge` selects real neural embedding — `bge-small-en-v1.5`
+via the vendored FastEmbed crate (`vendor/fastembed-4.9.0-no-image`, the same
+fork `fold` uses) — and requires a build with `--features neural`.
 
 The fixture reports `is_neural() == false`, and that is deliberate: the
 predecessor let 2,021 deterministic hash vectors reach its production index,
 where they shared a space with neural ones and were scored against them as if
 comparable. The boundary must be refusable at write time rather than
 discoverable in a later coverage audit.
+
+BGE is **asymmetric**: `lastseek query` prepends the model's query
+instruction, `lastseek add` does not. Embedding the same text through both
+paths produces different vectors on purpose.
+
+### Fetching the bge-small-en-v1.5 weights
+
+Neither the weights nor a fetch step ship in this repo — `neural`-feature
+tests skip themselves when the model files are absent, and CI never fetches
+them. To use `LASTSEEK_EMBEDDER=bge` locally, download the five files FastEmbed
+itself would pull from `Xenova/bge-small-en-v1.5` into
+`~/.lastseek/models/bge-small-en-v1.5` (or `$LASTSEEK_MODEL_DIR`):
+
+```bash
+dir="${LASTSEEK_MODEL_DIR:-$HOME/.lastseek/models/bge-small-en-v1.5}"
+mkdir -p "$dir"
+base="https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main"
+curl -L "$base/onnx/model.onnx" -o "$dir/model.onnx"
+for f in tokenizer.json config.json special_tokens_map.json tokenizer_config.json; do
+  curl -L "$base/$f" -o "$dir/$f"
+done
+```
 
 ## Usage
 

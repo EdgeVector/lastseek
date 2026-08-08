@@ -24,9 +24,9 @@ usage:
   --home DIR   store directory (default: $LASTSEEK_HOME or ~/.lastseek/index)
 
 The embedder is selected by LASTSEEK_EMBEDDER. `deterministic` is a TEST
-FIXTURE with no semantics and is refused for production stores. `minilm`
-loads all-MiniLM-L6-v2 from $LASTSEEK_MODEL_DIR or
-~/.lastseek/models/all-MiniLM-L6-v2 — requires a build with `--features neural`.
+FIXTURE with no semantics and is refused for production stores. `bge`
+loads bge-small-en-v1.5 from $LASTSEEK_MODEL_DIR or
+~/.lastseek/models/bge-small-en-v1.5 — requires a build with `--features neural`.
 ";
 
 fn home(args: &[String]) -> std::path::PathBuf {
@@ -78,27 +78,27 @@ fn flag_values(args: &[String], name: &str) -> Vec<String> {
 }
 
 /// Resolve the embedder. Returns a boxed `Embedder` because the concrete type
-/// depends on both the env var and, for `minilm`, whether this binary was
+/// depends on both the env var and, for `bge`, whether this binary was
 /// built with `--features neural`.
 fn embedder() -> Result<Box<dyn Embedder>, LastSeekError> {
     match std::env::var("LASTSEEK_EMBEDDER").as_deref() {
         Ok("deterministic") => Ok(Box::new(DeterministicEmbedder::new(384))),
         #[cfg(feature = "neural")]
-        Ok("minilm") => {
-            let dir = lastseek::embed::MiniLmEmbedder::default_model_dir();
-            Ok(Box::new(lastseek::embed::MiniLmEmbedder::load(&dir)?))
+        Ok("bge") => {
+            let dir = lastseek::embed::BgeSmallEmbedder::default_model_dir();
+            Ok(Box::new(lastseek::embed::BgeSmallEmbedder::load(&dir)?))
         }
         #[cfg(not(feature = "neural"))]
-        Ok("minilm") => Err(LastSeekError::Embedder(
-            "LASTSEEK_EMBEDDER=minilm requires a build with --features neural".into(),
+        Ok("bge") => Err(LastSeekError::Embedder(
+            "LASTSEEK_EMBEDDER=bge requires a build with --features neural".into(),
         )),
         Ok(other) => Err(LastSeekError::Embedder(format!(
             "unknown embedder {other:?}; set LASTSEEK_EMBEDDER=deterministic for fixtures \
-             or LASTSEEK_EMBEDDER=minilm for neural embedding"
+             or LASTSEEK_EMBEDDER=bge for neural embedding"
         ))),
         Err(_) => Err(LastSeekError::Embedder(
             "no embedder configured; set LASTSEEK_EMBEDDER=deterministic for fixtures \
-             or LASTSEEK_EMBEDDER=minilm for neural embedding"
+             or LASTSEEK_EMBEDDER=bge for neural embedding"
                 .into(),
         )),
     }
@@ -166,7 +166,7 @@ fn run() -> Result<(), LastSeekError> {
             }
             let store = VectorStore::open(&dir)?;
             let mut emb = embedder()?;
-            let q = emb.embed(std::slice::from_ref(&text))?.remove(0);
+            let q = emb.embed_query(std::slice::from_ref(&text))?.remove(0);
             let opts = QueryOpts {
                 k: parse_flag(&args, "--k")?,
                 schemas: flag_values(&args, "--schema"),
