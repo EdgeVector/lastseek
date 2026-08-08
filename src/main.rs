@@ -94,18 +94,39 @@ fn run() -> Result<(), LastSeekError> {
 
     match cmd.as_str() {
         "status" | "doctor" => {
-            let store = VectorStore::open(&dir)?;
-            let out = serde_json::json!({
-                "ok": true,
-                "home": dir.to_string_lossy(),
-                "embedder_id": store.embedder_id(),
-                "dimensions": store.dimensions(),
-                "committed_rows": store.committed_rows(),
-                "pending_ops": store.pending_ops(),
-                "slab_bytes": store.slab_bytes(),
-                "log_bytes": store.log_bytes(),
-            });
-            println!("{}", serde_json::to_string_pretty(&out)?);
+            match VectorStore::open(&dir) {
+                Ok(store) => {
+                    let out = serde_json::json!({
+                        "ok": true,
+                        "home": dir.to_string_lossy(),
+                        "needs_rebuild": false,
+                        "embedder_id": store.embedder_id(),
+                        "dimensions": store.dimensions(),
+                        "committed_rows": store.committed_rows(),
+                        "pending_ops": store.pending_ops(),
+                        "slab_bytes": store.slab_bytes(),
+                        "log_bytes": store.log_bytes(),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                }
+                // The index is local-only and regenerable, so an
+                // unsupported (e.g. pre-generations) store format is
+                // something callers can act on, not a hard error.
+                Err(LastSeekError::UnsupportedVersion(v)) => {
+                    let out = serde_json::json!({
+                        "ok": true,
+                        "home": dir.to_string_lossy(),
+                        "needs_rebuild": true,
+                        "reason": format!(
+                            "store format version {v} is no longer supported; \
+                             delete {} and rebuild",
+                            dir.to_string_lossy()
+                        ),
+                    });
+                    println!("{}", serde_json::to_string_pretty(&out)?);
+                }
+                Err(e) => return Err(e),
+            }
         }
         "query" => {
             let text = args
@@ -156,7 +177,7 @@ fn run() -> Result<(), LastSeekError> {
                 .collect::<Result<_, _>>()?;
             let mut emb = embedder()?;
             let mut store = VectorStore::open(&dir)?;
-            store.set_embedder(emb.id(), emb.dimensions())?;
+            store.set_embedder(emb.id(), emb.dimensions(), emb.is_neural())?;
             let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
             let vectors = emb.embed(&texts)?;
             let ops: Vec<PendingOp> = records
