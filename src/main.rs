@@ -26,6 +26,8 @@ usage:
   lastseek drain [--home DIR] [--inbox DIR] [--max-files N] [--consume]
                                       apply the host's IndexChangeBatch feed
   lastseek doctor [--home DIR]
+  lastseek status --coverage           add per-schema coverage (reads the node
+                                       catalog with row counts — EXPENSIVE)
   lastseek schema-table [--from PATH|URL] [--table PATH]
                                       refresh the Schema Service resolution table
   lastseek coverage-declare --schema S --live-records N [--source TEXT]
@@ -457,30 +459,73 @@ fn run() -> Result<(), LastSeekError> {
                         .iter()
                         .filter(|s| table.resolve(s).is_none())
                         .collect();
-                    let coverage = fetch_lastdb_catalog(&args).and_then(|(bytes, source)| {
-                        CoverageReport::from_catalog_json(
-                            &bytes,
-                            source,
-                            &table,
-                            &store.schema_row_counts(),
-                            &declared_counts,
-                            coverage_floor,
-                        )
-                    });
+                    // COVERAGE IS OPT-IN, and this is not a preference.
+                    //
+                    // Computing it needs the node's schema catalog WITH row
+                    // counts, and that read is brutally expensive: it counts
+                    // rows across ~1,141 schemas. Measured on the primary with
+                    // `lastdb ops`, `client=lastseek kind=schema` became the
+                    // single worst consumer on the whole node —
+                    //
+                    //   count=244  sum=5,519,430ms  avg=22,620ms  max=749,904ms
+                    //   194 cold shard loads PER CALL
+                    //
+                    // — 92 minutes of cumulative node time, with individual
+                    // calls taking twelve and a half minutes. It also made
+                    // `/api/schemas?include_counts=true` time out for everyone
+                    // else, and dragged kanban mutations to a 12.7s average.
+                    //
+                    // What turned an expensive report into a node-wide problem
+                    // was putting it on the DEFAULT `status` verb: brain's and
+                    // kanban's plane client calls `lastseek status` to decide
+                    // whether the plane is available, so every `brain ask` and
+                    // every `kanban search` was triggering a full catalog
+                    // count. A health check has to be cheaper than the thing it
+                    // checks.
+                    //
+                    // So `status` is now local-only by default — rows,
+                    // embedder, pending ops, the schema table, all read from
+                    // this store — and touches the node only when asked.
+                    let want_coverage = args.iter().any(|a| a == "--coverage");
+                    let coverage = if want_coverage {
+                        Some(fetch_lastdb_catalog(&args).and_then(|(bytes, source)| {
+                            CoverageReport::from_catalog_json(
+                                &bytes,
+                                source,
+                                &table,
+                                &store.schema_row_counts(),
+                                &declared_counts,
+                                coverage_floor,
+                            )
+                        }))
+                    } else {
+                        None
+                    };
                     // A catalog we could not reach is not evidence of a
                     // shortfall. Reporting `degraded` for it made the field
                     // unusable as an alert, which is the same failure as a
-                    // permanently-red floor.
-                    let state = coverage
-                        .as_ref()
-                        .map(CoverageReport::state)
-                        .unwrap_or("unknown");
+                    // permanently-red floor. Not having ASKED is likewise not
+                    // evidence — `state` is `unknown` until someone requests
+                    // coverage, never a guess in either direction.
+                    let state = match coverage.as_ref() {
+                        Some(Ok(report)) => report.state(),
+                        Some(Err(_)) => "unknown",
+                        None => "unknown",
+                    };
                     let coverage_json = match coverage {
-                        Ok(report) => serde_json::to_value(report)?,
-                        Err(error) => serde_json::json!({
+                        Some(Ok(report)) => serde_json::to_value(report)?,
+                        Some(Err(error)) => serde_json::json!({
                             "available": false,
                             "floor": coverage_floor,
                             "error": error.to_string(),
+                            "schemas": [],
+                        }),
+                        // Say plainly that it was not measured, and how to
+                        // measure it. An absent field would read as "no
+                        // problem found".
+                        None => serde_json::json!({
+                            "available": false,
+                            "reason": "not requested — coverage reads the node's schema catalog with row counts, which is expensive; pass --coverage",
                             "schemas": [],
                         }),
                     };

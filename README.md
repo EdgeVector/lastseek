@@ -84,6 +84,24 @@ that key, and never a readable name.
 
 ## Coverage: the owning app declares the denominator
 
+**Coverage is opt-in — `lastseek status --coverage`.** Computing it reads the
+node's schema catalog *with row counts*, which counts rows across ~1,141
+schemas. On the primary, measured with `lastdb ops`, that made
+`client=lastseek kind=schema` the single worst consumer on the node: 244 calls,
+5,519,430 ms total, 194 cold shard loads per call, one call at 749,904 ms — and
+it dragged unrelated reads into timeouts.
+
+What turned an expensive report into a node-wide problem was putting it on the
+DEFAULT `status` verb, because brain's and kanban's plane client calls
+`lastseek status` to decide whether the plane is up — so every `brain ask` was
+triggering a full catalog count. A health check has to be cheaper than the thing
+it checks.
+
+Plain `lastseek status` is therefore local-only: rows, embedder, pending ops and
+the schema table, all read from the store, no node call at all. It reports
+`state: unknown` and `coverage.available: false` with a reason, rather than
+implying all-clear.
+
 `lastseek status` reports, per schema, vectors held against the **live** records
 that exist — and it only rates schemas whose owning app has said how many that
 is:
