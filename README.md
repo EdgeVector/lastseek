@@ -108,6 +108,18 @@ The rule: **a coverage metric must divide by a count the owning app would
 recognise as its own.** The app is the only thing that knows, because it
 dual-writes the keyed secondary that makes its corpus enumerable without a scan.
 
+**The declared count is the app's claim, not a census LastSeek vouches for** —
+which is why `--source` is required rather than decorative. The example above
+uses `brain list --count`, and that instrument has measured defects in both
+directions: the list projection under-delivers (993 of 999 reference rows), while
+`--count` over-counts because deleted records stay countable. The residual error
+inflates the denominator, so it can only make coverage look *worse* than reality
+— a false red, never a false green.
+
+Recording the method keeps the fix where it belongs: when an app gets a better
+access pattern, its declaration changes and LastSeek does not. And a reader who
+distrusts a ratio can read the method that produced its denominator.
+
 **Declaring is opting in.** Without that, the floor applied to all 1,137 schemas
 on the node and produced 139 `degraded` entries dominated by machine schemas
 nobody wants searchable — `LastgitRepoPolicyEventV2` (12,633 rows),
