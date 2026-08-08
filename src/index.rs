@@ -21,7 +21,8 @@
 
 use crate::store::{id_hash, PendingOp, Record, VectorStore};
 use crate::LastSeekError;
-use std::collections::HashSet;
+use std::cmp::Ordering;
+use std::collections::{BinaryHeap, HashSet};
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hit {
@@ -45,7 +46,7 @@ pub struct QueryOpts {
 /// check is hoisted by the length assertion.
 #[inline]
 pub fn dot(a: &[f32], b: &[f32]) -> f32 {
-    assert_eq!(a.len(), b.len());
+    debug_assert_eq!(a.len(), b.len());
     let mut acc = 0.0f32;
     for i in 0..a.len() {
         acc += a[i] * b[i];
@@ -118,7 +119,16 @@ impl<'a> Searcher<'a> {
             shadowed.insert(id_hash(&op.record.id()));
         }
 
-        let mut scored: Vec<(f32, ScoredRef)> = Vec::new();
+        // `--exact` stays structural: a candidate must pass it to occupy a
+        // heap slot at all, so a low-scoring exact match can still displace
+        // a higher-scoring non-match. The text read that requires is paid
+        // only for candidates that clear the current heap's score bar (see
+        // `consider`), not for every row in the corpus.
+        let exact = opts.exact.as_ref().map(|q| q.to_lowercase());
+
+        // Bounded top-k: a min-heap capped at size k, so ranking the corpus
+        // costs O(n log k) instead of sorting all n scored candidates.
+        let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k + 1);
 
         for i in 0..self.store.committed_rows() {
             let Some(row) = self.store.row_at(i) else {
@@ -142,7 +152,14 @@ impl<'a> Searcher<'a> {
             if s < min {
                 continue;
             }
-            scored.push((s, ScoredRef::Committed(i)));
+            self.consider(
+                &mut heap,
+                k,
+                s,
+                row.id_hash,
+                ScoredRef::Committed(i),
+                &exact,
+            );
         }
 
         for (j, op) in self.store.pending().iter().enumerate() {
@@ -162,30 +179,81 @@ impl<'a> Searcher<'a> {
             if s < min {
                 continue;
             }
-            scored.push((s, ScoredRef::Pending(j)));
+            let idh = id_hash(&op.record.id());
+            self.consider(&mut heap, k, s, idh, ScoredRef::Pending(j), &exact);
         }
 
         // Deterministic order: score desc, then identity hash, so equal
         // scores do not reorder between runs. Compares hashes rather than
         // strings so the sort itself never touches meta.jsonl either.
-        scored.sort_by(|a, b| {
-            b.0.partial_cmp(&a.0)
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| self.id_hash_of(&a.1).cmp(&self.id_hash_of(&b.1)))
+        let mut winners: Vec<Candidate> = heap.into_vec();
+        winners.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| a.id_hash.cmp(&b.id_hash))
         });
 
-        Ok(scored
+        Ok(winners
             .into_iter()
-            .filter_map(|(score, r)| {
-                let record = self.record_of(&r)?;
-                Some(Hit { score, record })
+            .filter_map(|c| {
+                let record = c.record.or_else(|| self.record_of(&c.r))?;
+                Some(Hit {
+                    score: c.score,
+                    record,
+                })
             })
-            .filter(|h| match &opts.exact {
-                Some(q) => h.record.text.to_lowercase().contains(&q.to_lowercase()),
-                None => true,
-            })
-            .take(k)
             .collect())
+    }
+
+    /// Admit `r` into the bounded top-k heap if it beats the current worst
+    /// kept candidate (or the heap isn't full yet). When `--exact` is set,
+    /// the text read and match check happen here — only for candidates that
+    /// clear the score bar — so a non-matching high scorer never pays for a
+    /// text read it doesn't need, and a matching low scorer still gets a
+    /// fair look for as long as a heap slot is contested.
+    fn consider(
+        &self,
+        heap: &mut BinaryHeap<Candidate>,
+        k: usize,
+        score: f32,
+        id_hash: u64,
+        r: ScoredRef,
+        exact: &Option<String>,
+    ) {
+        let in_contention = heap.len() < k
+            || heap
+                .peek()
+                .map(|worst| {
+                    score > worst.score || (score == worst.score && id_hash < worst.id_hash)
+                })
+                .unwrap_or(true);
+        if !in_contention {
+            return;
+        }
+
+        let record = match exact {
+            Some(q) => {
+                let Some(record) = self.record_of(&r) else {
+                    return;
+                };
+                if !record.text.to_lowercase().contains(q) {
+                    return;
+                }
+                Some(record)
+            }
+            None => None,
+        };
+
+        if heap.len() >= k {
+            heap.pop();
+        }
+        heap.push(Candidate {
+            score,
+            id_hash,
+            r,
+            record,
+        });
     }
 
     fn record_of(&self, r: &ScoredRef) -> Option<Record> {
@@ -198,21 +266,47 @@ impl<'a> Searcher<'a> {
                 .map(|op: &PendingOp| op.record.clone()),
         }
     }
-
-    fn id_hash_of(&self, r: &ScoredRef) -> u64 {
-        match r {
-            ScoredRef::Committed(i) => self.store.row_at(*i).map(|row| row.id_hash).unwrap_or(0),
-            ScoredRef::Pending(j) => self
-                .store
-                .pending()
-                .get(*j)
-                .map(|op| id_hash(&op.record.id()))
-                .unwrap_or(0),
-        }
-    }
 }
 
 enum ScoredRef {
     Committed(usize),
     Pending(usize),
+}
+
+/// One kept top-k slot. `record` caches the text read from an `--exact`
+/// check so the final hydration pass never reads a row's text twice.
+struct Candidate {
+    score: f32,
+    id_hash: u64,
+    r: ScoredRef,
+    record: Option<Record>,
+}
+
+impl PartialEq for Candidate {
+    fn eq(&self, other: &Self) -> bool {
+        self.score == other.score && self.id_hash == other.id_hash
+    }
+}
+
+impl Eq for Candidate {}
+
+impl PartialOrd for Candidate {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for Candidate {
+    /// Orders by "worseness" so `BinaryHeap::peek()` returns the current
+    /// worst kept candidate in O(1): a lower score is worse (`Greater`), and
+    /// for equal scores a larger `id_hash` is worse — the same tie-break the
+    /// final sort applies, so the heap only ever evicts the slot the full
+    /// sort would have dropped too.
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.score
+            .partial_cmp(&other.score)
+            .unwrap_or(Ordering::Equal)
+            .reverse()
+            .then_with(|| self.id_hash.cmp(&other.id_hash))
+    }
 }
