@@ -121,7 +121,10 @@ fn fields_to_text(
     let mut parts: Vec<String> = Vec::new();
     for (k, v) in fields {
         if let Some(allow) = searchable {
-            if !allow.is_empty() && !allow.contains(k) {
+            // `Some([])` is the host's explicit "this schema has no
+            // searchable fields" signal. Treating it like `None` indexed
+            // every field of internal bookkeeping schemas instead.
+            if !allow.contains(k) {
                 continue;
             }
         }
@@ -152,6 +155,10 @@ pub struct BatchRecords {
     pub records: Vec<Record>,
     pub tombstones: Vec<Record>,
     pub skipped: Option<SkipReason>,
+    /// Upserts suppressed because the owner declared zero searchable fields.
+    /// Count rows, not batches, so status remains meaningful when batches are
+    /// coalesced differently by the host.
+    pub non_searchable_records_skipped: usize,
 }
 
 impl Batch {
@@ -174,6 +181,11 @@ impl Batch {
 
         let mut records = Vec::new();
         let mut tombstones = Vec::new();
+        let mut non_searchable_records_skipped = 0usize;
+        let schema_is_non_searchable = self
+            .searchable_fields
+            .as_ref()
+            .is_some_and(|fields| fields.is_empty());
         for change in &self.changes {
             let base = Record {
                 schema_identity: identity.clone(),
@@ -193,6 +205,17 @@ impl Batch {
                     deleted: true,
                     ..base
                 });
+                continue;
+            }
+            if schema_is_non_searchable {
+                // Delete any copy indexed before the owner applied the
+                // policy. Replaying an upsert may therefore clean old corpus
+                // state without a LastDB scan or a LastSeek-wide rebuild.
+                tombstones.push(Record {
+                    deleted: true,
+                    ..base
+                });
+                non_searchable_records_skipped += 1;
                 continue;
             }
             let Some(fields) = change.fields_and_values.as_ref() else {
@@ -215,6 +238,7 @@ impl Batch {
             records,
             tombstones,
             skipped,
+            non_searchable_records_skipped,
         }
     }
 }
@@ -232,6 +256,11 @@ pub struct Watermark {
     pub applied_through: String,
     #[serde(default)]
     pub files_applied: u64,
+    /// Cumulative owner-declared non-searchable upserts suppressed by drain.
+    /// Persisted beside the watermark so `lastseek status` can expose the
+    /// policy even when no drain is currently running.
+    #[serde(default)]
+    pub non_searchable_records_skipped: u64,
 }
 
 impl Watermark {
@@ -396,6 +425,34 @@ mod tests {
     }
 
     #[test]
+    fn an_explicit_empty_searchable_field_list_suppresses_and_deletes_the_row() {
+        let b = batch(
+            r#"{"schema_name":"card-registry","searchable_fields":[],
+                "changes":[{"mutation_id":"m1","kind":"upsert",
+                  "key_value":{"hash":"internal-k","range":null},
+                  "fields_and_values":{"title":"must not be embedded"}}]}"#,
+        );
+        let out = b.records(&table());
+        assert!(out.records.is_empty());
+        assert_eq!(out.tombstones.len(), 1);
+        assert!(out.tombstones[0].deleted);
+        assert_eq!(out.tombstones[0].key_hash.as_deref(), Some("internal-k"));
+        assert_eq!(out.non_searchable_records_skipped, 1);
+    }
+
+    #[test]
+    fn a_host_tombstone_for_a_non_searchable_schema_is_not_counted_as_a_skip() {
+        let b = batch(
+            r#"{"schema_name":"card-registry","searchable_fields":[],
+                "changes":[{"mutation_id":"m1","kind":"tombstone",
+                  "key_value":{"hash":"internal-k","range":null}}]}"#,
+        );
+        let out = b.records(&table());
+        assert_eq!(out.tombstones.len(), 1);
+        assert_eq!(out.non_searchable_records_skipped, 0);
+    }
+
+    #[test]
     fn a_record_with_no_prose_is_skipped_without_being_an_error() {
         let b = batch(
             r#"{"schema_name":"card-registry","changes":[
@@ -455,11 +512,13 @@ mod tests {
         Watermark {
             applied_through: "1786150243083_b.json".into(),
             files_applied: 2,
+            non_searchable_records_skipped: 7,
         }
         .save(dir.path())
         .unwrap();
         let back = Watermark::load(dir.path());
         assert_eq!(back.applied_through, "1786150243083_b.json");
         assert_eq!(back.files_applied, 2);
+        assert_eq!(back.non_searchable_records_skipped, 7);
     }
 }

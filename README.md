@@ -101,6 +101,14 @@ unnoticed. It advances a watermark rather than deleting batch files, so the
 incumbent Search app can keep reading the same inbox until cutover; `--consume`
 deletes them.
 
+Schema owners can opt an entire schema out of semantic indexing by declaring
+an explicit empty `searchable_fields` list in the host change feed. LastSeek
+treats absence of that field as the legacy "unspecified" case, but treats an
+empty list as "index nothing": upserts are suppressed and converted to
+tombstones so replaying owner records removes copies indexed under an older
+policy. `lastseek status` exposes the cumulative
+`non_searchable_records_skipped` count from the durable drain watermark.
+
 Backfill is the owning app feeding its own records: brain and kanban can
 enumerate theirs without a scan because they dual-write the keyed secondaries
 that make enumeration possible. A central backfill would have to guess, for
