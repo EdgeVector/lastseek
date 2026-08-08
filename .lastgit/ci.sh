@@ -17,6 +17,24 @@ grep -q "not CloudSync product data" README.md
 test ! -d vendor/laststore
 
 bash -n .lastgit/ci.sh
+bash -n .lastgit/artifact-release.sh
+
+# The feature-complete binary is built only by the dedicated release context.
+# Keep this gate cheap while proving the publication route cannot silently
+# fall back to ci-required.
+jq -e '
+  [.artifacts[]
+    | select(
+        .app == "lastseek"
+        and .context == "artifact-release"
+        and .paths == ["dist/lastseek"]
+      )]
+  | length == 1
+' .lastgit/artifacts.json >/dev/null
+if grep -qE '^[[:space:]]*(bash[[:space:]]+)?\.lastgit/artifact-release\.sh([[:space:]]|$)' .lastgit/ci.sh; then
+  echo "ci-required must not invoke the artifact-release context" >&2
+  exit 1
+fi
 
 # The gate builds an explicit feature set, NOT --all-features.
 #
@@ -44,7 +62,10 @@ bash -n .lastgit/ci.sh
 FEATURES=fault-injection
 
 # Guard the reason above against a well-meaning re-broadening.
-! grep -qE '^\s*cargo (clippy|test).*--all-features' .lastgit/ci.sh
+if grep -qE '^[[:space:]]*cargo (clippy|test).*--all-features' .lastgit/ci.sh; then
+  echo "ci-required must not build all features" >&2
+  exit 1
+fi
 
 cargo fmt --all -- --check
 cargo clippy --all-targets --features "$FEATURES" -- -D warnings
