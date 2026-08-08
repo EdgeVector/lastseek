@@ -8,7 +8,7 @@
 //! not require a network fetch of weights to stay green.
 #![cfg(feature = "neural")]
 
-use lastseek::embed::{Embedder, MiniLmEmbedder};
+use lastseek::embed::{DeterministicEmbedder, Embedder, MiniLmEmbedder};
 use lastseek::store::{PendingOp, Record, VectorStore};
 
 fn load_or_skip() -> Option<MiniLmEmbedder> {
@@ -57,9 +57,7 @@ fn round_trip_through_the_store_preserves_neural_vectors_exactly() {
     };
     let dir = tempfile::tempdir().unwrap();
     let mut store = VectorStore::open(dir.path()).unwrap();
-    store
-        .set_embedder(emb.id(), emb.dimensions(), emb.is_neural())
-        .unwrap();
+    store.bind_embedder(&emb).unwrap();
 
     let v = emb.embed(&["exact round trip check".to_string()]).unwrap();
     store
@@ -88,13 +86,24 @@ fn a_neural_store_refuses_a_fixture_vector() {
     };
     let dir = tempfile::tempdir().unwrap();
     let mut store = VectorStore::open(dir.path()).unwrap();
+    store.bind_embedder(&emb).unwrap();
+    let v = emb.embed(&["warm the session".to_string()]).unwrap();
     store
-        .set_embedder(emb.id(), emb.dimensions(), emb.is_neural())
+        .append(&[PendingOp {
+            record: Record {
+                schema_name: "concept".into(),
+                key_hash: Some("a".into()),
+                key_range: None,
+                fragment_key: "body".into(),
+                text: "warm the session".into(),
+                mutation_id: None,
+                deleted: false,
+            },
+            vector: Some(v[0].clone()),
+        }])
         .unwrap();
-    let _ = emb.embed(&["warm the session".to_string()]).unwrap();
 
-    let err = store
-        .set_embedder("deterministic-test-fixture", emb.dimensions(), false)
-        .unwrap_err();
-    assert!(err.to_string().contains("refusing"));
+    let fixture = DeterministicEmbedder::new(emb.dimensions());
+    let err = store.bind_embedder(&fixture).unwrap_err();
+    assert!(err.to_string().contains("refus"));
 }
