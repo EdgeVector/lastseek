@@ -114,6 +114,27 @@ enumerate theirs without a scan because they dual-write the keyed secondaries
 that make enumeration possible. A central backfill would have to guess, for
 every app forever, which of its fields are prose.
 
+## Coverage status reads LastDB, by design
+
+`lastseek status` compares vectors held with source records available for each
+schema and reports `state: healthy|degraded`. The default healthy floor is 95%;
+override it with `--coverage-floor` only when an operator deliberately wants a
+different policy. Source counts come from
+`GET /api/schemas?include_counts=true` over the LastDB Unix socket. This is the
+status half of LastSeek's existing LastDB relationship (records and changes),
+not a third outside dependency; Schema Service remains the independent source
+of definitive names and canonical identities.
+
+Coverage deliberately joins `catalog.name -> Schema Service identity ->
+LastSeek interned id`. It never keys on the node catalog's `identity_hash`,
+which is recomputed by the running node and disagrees with Schema Service on
+the live brain/kanban schemas. Multiple catalog aliases that resolve to one
+canonical identity are collapsed using the maximum record count rather than
+summed, so the six `Card` identities cannot multiply one logical denominator.
+If the catalog cannot be read, status fails closed as `degraded` with a
+`coverage.available: false` diagnostic instead of claiming health from
+internal consistency alone.
+
 ## Embedders
 
 `LASTSEEK_EMBEDDER=deterministic` selects a test fixture with no semantics, so
