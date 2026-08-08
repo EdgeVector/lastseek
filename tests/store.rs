@@ -730,4 +730,49 @@ mod fault_injection {
             }
         }
     }
+
+    /// Direct regression test for the gap in the crash matrix above: a panic
+    /// mid-`compact()` proves nothing about durability, because the OS page
+    /// cache survives a process crash whether or not the preceding `fsync`
+    /// ran. Deleting any `sync_all()` call from the compaction path left that
+    /// test fully green. This test instead counts every durability sync that
+    /// actually fires and pins the count, so dropping one fails loudly here
+    /// instead of silently passing the crash matrix.
+    ///
+    /// One full non-empty `compact()` performs exactly 8 syncs:
+    /// `build_generation` syncs `vectors.f32`, `rows.bin`, `meta.jsonl`, and
+    /// `manifest.json` (4), then `compact()` itself syncs the staging
+    /// directory, the directory entry after the generation rename, the
+    /// `CURRENT.tmp` file, and the directory entry after the `CURRENT` rename
+    /// (4 more).
+    #[test]
+    fn compaction_performs_every_expected_durability_sync() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut emb = DeterministicEmbedder::new(DIMS);
+        let mut store = VectorStore::open(dir.path()).unwrap();
+        store.bind_embedder(&emb).unwrap();
+        let docs = [("concept", "a", "alpha"), ("concept", "b", "beta")];
+        let texts: Vec<String> = docs.iter().map(|d| d.2.to_string()).collect();
+        let vecs = emb.embed(&texts).unwrap();
+        let ops: Vec<PendingOp> = docs
+            .iter()
+            .zip(vecs)
+            .map(|(d, v)| PendingOp {
+                record: rec(d.0, d.1, d.2),
+                vector: Some(v),
+            })
+            .collect();
+        store.append(&ops).unwrap();
+
+        fault::reset_sync_count();
+        store.compact().unwrap();
+        assert_eq!(
+            fault::sync_count(),
+            8,
+            "compact() performed {} durability syncs, expected exactly 8 — a \
+             sync was added or removed from the generation-swap path without \
+             updating this pinned count",
+            fault::sync_count()
+        );
+    }
 }

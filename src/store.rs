@@ -44,6 +44,25 @@
 //! filtering happen without ever touching `meta.jsonl`. `meta.jsonl` is
 //! parsed one line at a time, only for rows that survive into the result set
 //! — that's what makes the residency property real rather than aspirational.
+//!
+//! # Durability decision: process-crash, not power-loss
+//!
+//! Every sync in the generation-swap path above is `File::sync_all`, i.e.
+//! `fsync(2)`. On macOS/APFS, `fsync` does **not** flush the drive's write
+//! cache — only `fcntl(fd, F_FULLFSYNC)` does. `laststore` (`src/durability.rs`,
+//! LastDB's Storage v2 engine) pays that extra barrier on every dirty-file sync,
+//! because it holds the data of record and a torn write there is real,
+//! unrecoverable data loss.
+//!
+//! LastSeek makes the opposite call, deliberately: this index holds nothing
+//! that doesn't already live elsewhere (LastDB's own storage). A generation
+//! torn by an actual power loss costs a rebuild — `lastseek` re-embeds and
+//! re-appends from source — never data. So LastSeek does not call
+//! `F_FULLFSYNC`, and does not need to. The crash-safety argument two
+//! paragraphs up (interior atomicity via staging + rename) holds fully against
+//! **process** crashes — panics, `kill -9`, OOM — because the OS page cache
+//! survives those regardless of whether the underlying fsync reached the
+//! platter. It does not, and is not meant to, hold against power loss.
 
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
@@ -247,6 +266,12 @@ pub mod fault {
         // its own thread, and compact() calls from unrelated tests must
         // never see this test's armed fault point.
         static ARMED: Cell<u8> = const { Cell::new(255) };
+        // Counts calls into `durable_sync`, i.e. every fsync that actually ran.
+        // A crash (panic) proves ordering, not durability — the OS page cache
+        // survives a panic regardless of whether the fsync below it ran. This
+        // counter is the thing that catches a future edit silently dropping a
+        // sync: the matrix test asserts the exact expected count.
+        static SYNC_COUNT: Cell<usize> = const { Cell::new(0) };
     }
 
     /// Arm the next `compact()` call **on this thread** to panic once it
@@ -265,6 +290,21 @@ pub mod fault {
             disarm();
             panic!("fault-injection: simulated crash at {point:?}");
         }
+    }
+
+    pub(crate) fn record_sync() {
+        SYNC_COUNT.with(|c| c.set(c.get() + 1));
+    }
+
+    /// Zero the sync counter on this thread. Call before the operation under
+    /// test so an unrelated setup call (e.g. `append`) doesn't inflate the count.
+    pub fn reset_sync_count() {
+        SYNC_COUNT.with(|c| c.set(0));
+    }
+
+    /// Durability syncs recorded since the last `reset_sync_count`.
+    pub fn sync_count() -> usize {
+        SYNC_COUNT.with(|c| c.get())
     }
 }
 
@@ -301,10 +341,20 @@ fn lock_writer(dir: &Path) -> Result<WriterLock, LastSeekError> {
     Ok(WriterLock(f))
 }
 
+/// `File::sync_all`, counted under `fault-injection` so the compaction fault
+/// matrix can assert that every durability-critical sync actually ran instead
+/// of only proving crash-ordering (see the module doc's "process-crash vs.
+/// power-loss" section).
+fn durable_sync(file: &File) -> Result<(), LastSeekError> {
+    file.sync_all()?;
+    #[cfg(feature = "fault-injection")]
+    fault::record_sync();
+    Ok(())
+}
+
 /// fsync a directory's own entry, so renames/creates inside it are durable.
 fn sync_dir(dir: &Path) -> Result<(), LastSeekError> {
-    File::open(dir)?.sync_all()?;
-    Ok(())
+    durable_sync(&File::open(dir)?)
 }
 
 fn load_pending(dir: &Path) -> Result<Vec<PendingOp>, LastSeekError> {
@@ -566,7 +616,7 @@ impl VectorStore {
             }
             w.flush()?;
         }
-        f.sync_all()?;
+        durable_sync(&f)?;
         self.pending.extend_from_slice(ops);
         Ok(())
     }
@@ -664,7 +714,7 @@ impl VectorStore {
         {
             let mut f = File::create(&current_tmp)?;
             f.write_all(new_generation.to_string().as_bytes())?;
-            f.sync_all()?;
+            durable_sync(&f)?;
         }
         fault_point!(FaultPoint::AfterCurrentTmpWritten);
         std::fs::rename(&current_tmp, self.dir.join(CURRENT_FILE))?;
@@ -772,9 +822,9 @@ impl VectorStore {
         drop(vw);
         drop(rw);
         drop(mw);
-        vectors_f.sync_all()?;
-        rows_f.sync_all()?;
-        meta_f.sync_all()?;
+        durable_sync(&vectors_f)?;
+        durable_sync(&rows_f)?;
+        durable_sync(&meta_f)?;
         drop(vectors_f);
         drop(rows_f);
         drop(meta_f);
@@ -793,7 +843,7 @@ impl VectorStore {
         };
         let mf = File::create(staging.join(MANIFEST_FILE))?;
         serde_json::to_writer_pretty(&mf, &manifest)?;
-        mf.sync_all()?;
+        durable_sync(&mf)?;
 
         Ok(())
     }
