@@ -11,6 +11,17 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
 fs2 = "0.4"
+# Neural embedding is opt-in (see `neural` feature below) so a default build
+# links no inference runtime and downloads no model weights.
+ort = { version = "2.0.0-rc.13", optional = true, default-features = false, features = [
+    "std",
+    "tracing",
+    "download-binaries",
+    "tls-native",
+    "copy-dylibs",
+    "api-27",
+] }
+tokenizers = { version = "0.21", optional = true }
 
 [dev-dependencies]
 tempfile = "3"
@@ -19,6 +30,9 @@ tempfile = "3"
 # Table-driven crash simulation for compact() (tests/store.rs). Never linked
 # into a default build.
 fault-injection = []
+# ort's `ndarray` feature conflicts with a standalone `ndarray` dependency, so
+# outputs are read via `Tensor::try_extract_tensor` (shape, &[T]) instead.
+neural = ["dep:ort", "dep:tokenizers"]
 
 [profile.release]
 opt-level = 3
