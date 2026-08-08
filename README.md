@@ -203,3 +203,24 @@ machine that has the weights:
 ```bash
 cargo test --release --features neural,fault-injection
 ```
+
+### Artifact release context
+
+The installable binary is produced by the separate LastGit
+`artifact-release` context. It builds with `--features neural`, stages only
+`dist/lastseek`, and publishes an immutable artifact whose manifest records the
+exact source commit. The required `ci-required` merge gate never invokes this
+slow build.
+
+On the forge host, run the context against a cursor seeded immediately before
+the target `main` update so the watcher builds that exact new tip without
+replaying historical commits:
+
+```bash
+lastgit ci watch --repo lastseek \
+  --context artifact-release \
+  --ref refs/heads/main \
+  --state-file /path/to/pre-update.cursor \
+  --timeout-ms 900000 \
+  --once
+```
