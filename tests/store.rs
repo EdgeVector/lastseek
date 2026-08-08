@@ -960,3 +960,45 @@ fn an_uncompacted_row_is_reachable_by_readable_name() {
     assert_eq!(hits.len(), 1, "the pending Milestone row must be reachable");
     assert_eq!(hits[0].record.schema_identity, "ms-ident");
 }
+
+// ---------------------------------------------------------------------------
+// A store names its own embedder.
+//
+// Callers reach LastSeek by spawning it, so the subprocess inherits whatever
+// environment the parent happened to have. When `LASTSEEK_EMBEDDER` was
+// required, an unset variable made `lastseek query` exit non-zero, which brain
+// and kanban correctly read as "plane unavailable" and answered from the
+// incumbent instead — a working index, silently unused, on every host that had
+// not exported a variable nothing documented needing.
+//
+// The CLI's resolution is exercised end to end by `tests/cli.rs`; this asserts
+// the property it depends on: the store reports the embedder identity a caller
+// must use, and `Searcher` refuses any other, so inferring it cannot pick wrong.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_store_reports_the_embedder_a_caller_must_query_it_with() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = seed(dir.path(), &[("concept", "a", "alpha beta")]);
+    // Bound at seed time, and readable without an env var or a guess.
+    assert_eq!(store.embedder_id(), "deterministic-test-fixture");
+
+    // …and it is the only id that can query it, which is what makes inferring
+    // the embedder from the store safe rather than convenient.
+    // `Searcher` is not Debug, so match rather than unwrap_err.
+    match Searcher::new(&store, "fastembed/bge-small-en-v1.5") {
+        Err(LastSeekError::EmbedderBoundary(_)) => {}
+        Err(other) => panic!("expected EmbedderBoundary, got {other:?}"),
+        Ok(_) => panic!("querying with the wrong embedder must be refused"),
+    }
+    assert!(Searcher::new(&store, store.embedder_id()).is_ok());
+}
+
+#[test]
+fn a_fresh_store_names_no_embedder_so_a_caller_must_be_told() {
+    // The one case where the variable is genuinely load-bearing: there is
+    // nothing to infer from yet.
+    let dir = tempfile::tempdir().unwrap();
+    let store = VectorStore::open(dir.path()).unwrap();
+    assert_eq!(store.embedder_id(), "");
+}
