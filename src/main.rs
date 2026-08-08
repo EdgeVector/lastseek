@@ -44,10 +44,13 @@ registry name, and is resolved through the Schema Service table. A schema name
 that resolves to nothing is an ERROR, not an empty result — those are different
 answers and callers depend on telling them apart.
 
-The embedder is selected by LASTSEEK_EMBEDDER. `deterministic` is a TEST
-FIXTURE with no semantics and is refused for production stores. `bge`
-loads bge-small-en-v1.5 from $LASTSEEK_MODEL_DIR or
-~/.lastseek/models/bge-small-en-v1.5 — requires a build with `--features neural`.
+A store names its own embedder, so LASTSEEK_EMBEDDER is an OVERRIDE, not a
+requirement: querying a store built with bge-small-en-v1.5 loads that model
+without being told. Only a fresh, unbound store needs telling. `bge` loads
+bge-small-en-v1.5 from $LASTSEEK_MODEL_DIR or
+~/.lastseek/models/bge-small-en-v1.5 and requires a build with
+`--features neural`; `deterministic` is a TEST FIXTURE with no semantics and is
+refused for production stores.
 ";
 
 fn home(args: &[String]) -> std::path::PathBuf {
@@ -148,30 +151,72 @@ fn flag_values(args: &[String], name: &str) -> Vec<String> {
     out
 }
 
-/// Resolve the embedder. Returns a boxed `Embedder` because the concrete type
-/// depends on both the env var and, for `bge`, whether this binary was
-/// built with `--features neural`.
-fn embedder() -> Result<Box<dyn Embedder>, LastSeekError> {
-    match std::env::var("LASTSEEK_EMBEDDER").as_deref() {
-        Ok("deterministic") => Ok(Box::new(DeterministicEmbedder::new(384))),
+/// Short selector name for an embedder id, so a store can name its own.
+///
+/// The store persists a full identity (`fastembed/bge-small-en-v1.5`); the CLI
+/// selector is the short form (`bge`). Mapping between them here keeps the
+/// persisted identity unabbreviated — it is the thing that must never be
+/// ambiguous — while the selector stays typeable.
+fn selector_for_embedder_id(id: &str) -> Option<&'static str> {
+    match id {
+        "fastembed/bge-small-en-v1.5" => Some("bge"),
+        "deterministic-test-fixture" => Some("deterministic"),
+        _ => None,
+    }
+}
+
+/// Resolve the embedder for a store.
+///
+/// `LASTSEEK_EMBEDDER` wins when set. When it is not, **the store names its own
+/// embedder**: a store bound to `fastembed/bge-small-en-v1.5` is queried with
+/// that model, because `Searcher::new` would refuse anything else anyway — a
+/// query embedded with the wrong embedder is a config error, not a corpus with
+/// no matches. Requiring the variable added a way to get that error and no way
+/// to get a different answer.
+///
+/// This is not a convenience. Callers reach LastSeek by spawning it (brain and
+/// kanban both do), so the subprocess sees whatever environment the parent
+/// happened to have. An unset variable made `lastseek query` exit non-zero,
+/// which those callers correctly read as "plane unavailable" and answered from
+/// the incumbent instead — a working index, silently unused, on every host that
+/// had not exported a variable nobody documents needing.
+///
+/// An empty store (no embedder bound yet) still needs to be told, since there
+/// is nothing to infer from; `add` on a fresh store is the one place the
+/// variable is genuinely load-bearing.
+fn embedder_for(store_embedder_id: &str) -> Result<Box<dyn Embedder>, LastSeekError> {
+    let from_env = std::env::var("LASTSEEK_EMBEDDER").ok();
+    let selector = match from_env.as_deref() {
+        Some(s) => s,
+        None => selector_for_embedder_id(store_embedder_id).ok_or_else(|| {
+            LastSeekError::Embedder(if store_embedder_id.is_empty() {
+                "this store has no embedder bound yet, so there is nothing to infer: set \
+                 LASTSEEK_EMBEDDER=bge for neural embedding or =deterministic for fixtures"
+                    .to_string()
+            } else {
+                format!(
+                    "store is bound to embedder {store_embedder_id:?}, which this binary has no \
+                     selector for; set LASTSEEK_EMBEDDER explicitly"
+                )
+            })
+        })?,
+    };
+
+    match selector {
+        "deterministic" => Ok(Box::new(DeterministicEmbedder::new(384))),
         #[cfg(feature = "neural")]
-        Ok("bge") => {
+        "bge" => {
             let dir = lastseek::embed::BgeSmallEmbedder::default_model_dir();
             Ok(Box::new(lastseek::embed::BgeSmallEmbedder::load(&dir)?))
         }
         #[cfg(not(feature = "neural"))]
-        Ok("bge") => Err(LastSeekError::Embedder(
-            "LASTSEEK_EMBEDDER=bge requires a build with --features neural".into(),
+        "bge" => Err(LastSeekError::Embedder(
+            "bge requires a build with --features neural".into(),
         )),
-        Ok(other) => Err(LastSeekError::Embedder(format!(
+        other => Err(LastSeekError::Embedder(format!(
             "unknown embedder {other:?}; set LASTSEEK_EMBEDDER=deterministic for fixtures \
              or LASTSEEK_EMBEDDER=bge for neural embedding"
         ))),
-        Err(_) => Err(LastSeekError::Embedder(
-            "no embedder configured; set LASTSEEK_EMBEDDER=deterministic for fixtures \
-             or LASTSEEK_EMBEDDER=bge for neural embedding"
-                .into(),
-        )),
     }
 }
 
@@ -276,7 +321,7 @@ fn run() -> Result<(), LastSeekError> {
             }
             let store = VectorStore::open(&dir)?;
             let table = load_schema_table(&args);
-            let mut emb = embedder()?;
+            let mut emb = embedder_for(store.embedder_id())?;
             let q = emb.embed_query(std::slice::from_ref(&text))?.remove(0);
             let opts = QueryOpts {
                 k: parse_flag(&args, "--k")?,
@@ -320,8 +365,8 @@ fn run() -> Result<(), LastSeekError> {
                 .filter(|l| !l.trim().is_empty())
                 .map(serde_json::from_str)
                 .collect::<Result<_, _>>()?;
-            let mut emb = embedder()?;
             let mut store = VectorStore::open(&dir)?;
+            let mut emb = embedder_for(store.embedder_id())?;
             store.bind_embedder(emb.as_ref())?;
             let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
             let vectors = emb.embed(&texts)?;
@@ -355,8 +400,8 @@ fn run() -> Result<(), LastSeekError> {
             let (files, remaining) =
                 lastseek::ingest::pending_batches(&inbox, &mark.applied_through, max)?;
 
-            let mut emb = embedder()?;
             let mut store = VectorStore::open(&dir)?;
+            let mut emb = embedder_for(store.embedder_id())?;
             store.bind_embedder(emb.as_ref())?;
 
             let mut applied_records = 0usize;
