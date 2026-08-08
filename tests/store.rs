@@ -549,6 +549,95 @@ fn query_with_a_mismatched_embedder_id_errors_instead_of_returning_empty() {
     }
 }
 
+/// Regression gate for the bounded top-k rewrite: `search()` must stay
+/// within 3x of a raw dot-product pass over the same corpus. Release-only —
+/// a debug build's cost is dominated by unoptimized scalar math and
+/// `debug_assert!`s that say nothing about the algorithmic fix (sorting the
+/// whole corpus vs. a size-k heap), and `.lastgit/ci.sh` already runs
+/// `cargo test --release`.
+#[cfg(not(debug_assertions))]
+#[test]
+fn search_stays_within_3x_of_the_raw_scan() {
+    use std::time::Instant;
+
+    const ROWS: usize = 50_000;
+    const BENCH_DIMS: usize = 384;
+    const BATCH: usize = 5_000;
+
+    let dir = tempfile::tempdir().unwrap();
+    let mut emb = DeterministicEmbedder::new(BENCH_DIMS);
+    let mut store = VectorStore::open(dir.path()).unwrap();
+    store.bind_embedder(&emb).unwrap();
+
+    let mut i = 0;
+    while i < ROWS {
+        let end = (i + BATCH).min(ROWS);
+        let texts: Vec<String> = (i..end)
+            .map(|n| format!("record {n} filler benchmark corpus text goes here {n}"))
+            .collect();
+        let vecs = emb.embed(&texts).unwrap();
+        let ops: Vec<PendingOp> = (i..end)
+            .zip(&texts)
+            .zip(vecs)
+            .map(|((n, text), v)| PendingOp {
+                record: rec("bench", &format!("k{n}"), text),
+                vector: Some(v),
+            })
+            .collect();
+        store.append(&ops).unwrap();
+        i = end;
+    }
+    store.compact().unwrap();
+    drop(store);
+    let store = VectorStore::open(dir.path()).unwrap();
+
+    let q = emb
+        .embed(&["record 42 filler benchmark corpus text goes here 42".to_string()])
+        .unwrap()
+        .remove(0);
+
+    // The floor cost this query could ever beat: the raw dot-product pass
+    // with no ranking machinery at all. Best-of-3 to damp scheduler noise.
+    let raw = (0..3)
+        .map(|_| {
+            let start = Instant::now();
+            let mut acc = 0.0f32;
+            for i in 0..store.committed_rows() {
+                acc += lastseek::index::dot(&q, store.vector_at(i).unwrap());
+            }
+            std::hint::black_box(acc);
+            start.elapsed()
+        })
+        .min()
+        .unwrap();
+
+    let searcher = Searcher::new(&store, emb.id()).unwrap();
+    let searched = (0..3)
+        .map(|_| {
+            let start = Instant::now();
+            let hits = searcher
+                .search(
+                    &q,
+                    &QueryOpts {
+                        k: Some(20),
+                        ..Default::default()
+                    },
+                )
+                .unwrap();
+            std::hint::black_box(&hits);
+            start.elapsed()
+        })
+        .min()
+        .unwrap();
+
+    assert!(
+        searched <= raw * 3,
+        "search() took {searched:?} against a {raw:?} raw scan over {ROWS} rows \
+         ({:.1}x) — bounded top-k must stay within 3x of the raw dot-product pass",
+        searched.as_secs_f64() / raw.as_secs_f64().max(1e-9)
+    );
+}
+
 #[cfg(feature = "fault-injection")]
 mod fault_injection {
     use lastseek::embed::{DeterministicEmbedder, Embedder};
