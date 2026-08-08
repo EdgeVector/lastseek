@@ -46,6 +46,66 @@ never a post-filter over a global top-k — that silently returns fewer than `k`
 results, or none, whenever the scoped schema is not already in the global head.
 This is a correctness property, not an optimisation.
 
+## Schema scope resolves through the Schema Service
+
+`--schema` takes what a caller would naturally write:
+
+```bash
+lastseek query "durable compaction" --schema Card        # readable name
+lastseek query "durable compaction" --schema bc941dbc…   # identity hash
+lastseek query "durable compaction" --schema 183416…     # registry name
+```
+
+The index keys rows on a canonical **schema identity hash**, and the readable
+name → identity table comes from the **Schema Service**, directly — SS holds the
+definitive names. Refresh it with `lastseek schema-table`; it caches to
+`~/.lastseek/schema-table.json`.
+
+A readable name is deliberately **set-valued**: `Card` is six distinct
+identities on the live registry, and resolving to one of them would be a quiet
+version of the bug below.
+
+**A schema name that resolves to nothing is an error, never an empty result.**
+
+```
+$ lastseek query "anything" --schema Crad
+lastseek: unknown schema "Crad"; known names include: Card
+```
+
+That distinction is the whole point. The predecessor returned `Ok([])` for both
+"you spelled the schema differently than ingest wrote it" and "that schema has
+no rows yet", live, on brain's and kanban's own corpora — `--schema Card`
+returned zero hits while the same query scoped by the interned hash returned
+correctly ranked results.
+
+Ingest performs the same translation from the same table, so ingest and query
+key off one authority and agree by construction. `Record.schema_identity` holds
+that key, and never a readable name.
+
+## Ingest: a push feed and an app-driven backfill — no scan
+
+LastDB is Dynamo-shaped: point get, range under one hash, **no scan**. So
+"page every schema to build the first index" is not a path LastSeek has.
+
+```bash
+lastseek drain                  # apply the host's IndexChangeBatch feed
+lastseek add < records.jsonl    # an app feeding its own corpus
+```
+
+`drain` reads the batch files the host's outbox sink already writes to
+`$LASTDB_HOME/apps/search/inbox/`. It is **bounded** (`--max-files`, default
+2000) and reports `remaining`, because an unbounded drain over a large backlog
+is what took the machine down on 2026-08-07 — and a capped run that reports
+nothing reads as "inbox empty", which is how that backlog reached 99k files
+unnoticed. It advances a watermark rather than deleting batch files, so the
+incumbent Search app can keep reading the same inbox until cutover; `--consume`
+deletes them.
+
+Backfill is the owning app feeding its own records: brain and kanban can
+enumerate theirs without a scan because they dual-write the keyed secondaries
+that make enumeration possible. A central backfill would have to guess, for
+every app forever, which of its fields are prose.
+
 ## Embedders
 
 `LASTSEEK_EMBEDDER=deterministic` selects a test fixture with no semantics, so
@@ -85,15 +145,32 @@ done
 ## Usage
 
 ```bash
-lastseek status
-lastseek query "write amplification" --k 5 --schema concept
-lastseek add < records.jsonl
-lastseek compact
+lastseek schema-table                                   # refresh the SS name table
+lastseek status                                          # rows, embedder, table, SS gaps
+lastseek query "write amplification" --k 5 --schema Concept
+lastseek drain                                           # host feed -> index
+lastseek add < records.jsonl                             # an app's own corpus
+lastseek compact                                         # fold the log into the slab
 ```
+
+A cold `lastseek query` — fork, load the model, map the index, embed, score,
+print — is **~100 ms**. That is why there is no resident daemon: the reason to
+keep a search process warm was the predecessor's multi-second Node +
+transformers.js startup, and `ort` does not have it.
 
 ## Development
 
 ```bash
 cargo test
 bash .lastgit/ci.sh
+```
+
+The required gate builds an **explicit** feature set, not `--all-features`.
+`--all-features` turns on `neural`, which downloads ONNX Runtime at build time
+(contradicting the gate's own weightless contract) and takes ~11.5 minutes in
+release — past LastGit's 600 s CI timeout. Run the neural tests locally, on a
+machine that has the weights:
+
+```bash
+cargo test --release --features neural,fault-injection
 ```

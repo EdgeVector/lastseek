@@ -107,9 +107,26 @@ fn gen_dir_name(generation: u64) -> String {
 
 /// Identity and payload for one indexed fragment. Deliberately NOT co-located
 /// with the vector slab: scoring must never page this in.
+///
+/// # The ingest convention, stated
+///
+/// `schema_identity` holds a **canonical schema identity key** — the
+/// `identity_hash` the Schema Service publishes for the schema, resolved from
+/// the registry `name` a host batch carries (see `crate::schema`). It is never
+/// a readable descriptive name, and never the node's locally recomputed
+/// identity hash.
+///
+/// This used to be an unstated `schema_name: String`, and that omission was the
+/// whole of two live defects: the predecessor's host wrote the registry `name`
+/// while its coverage metric counted under `identity_hash`, so coverage read
+/// 2.7% over a working index; and `--schema Card` matched nothing because
+/// nothing on the write path had ever written a descriptive name. The field
+/// deserializes from `schema_name` too, so batches and JSONL written against
+/// the old shape still load.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Record {
-    pub schema_name: String,
+    #[serde(alias = "schema_name")]
+    pub schema_identity: String,
     pub key_hash: Option<String>,
     pub key_range: Option<String>,
     pub fragment_key: String,
@@ -126,7 +143,7 @@ impl Record {
     pub fn id(&self) -> String {
         format!(
             "{}\u{0}{}\u{0}{}\u{0}{}",
-            self.schema_name,
+            self.schema_identity,
             self.key_hash.as_deref().unwrap_or(""),
             self.key_range.as_deref().unwrap_or(""),
             self.fragment_key
@@ -515,13 +532,22 @@ impl VectorStore {
         self.meta_reads.get()
     }
 
-    /// Interned id for a schema name, if any committed row uses it.
-    pub fn schema_id(&self, name: &str) -> Option<u32> {
+    /// Interned id for a schema identity key, if any committed row uses it.
+    pub fn schema_id(&self, identity: &str) -> Option<u32> {
         self.manifest
             .schemas
             .iter()
-            .position(|s| s == name)
+            .position(|s| s == identity)
             .map(|p| p as u32)
+    }
+
+    /// Every schema identity key this generation has interned.
+    ///
+    /// Scope resolution consults this as its last tier, so a schema whose owner
+    /// has not published to the Schema Service stays searchable by the key
+    /// ingest saw rather than becoming unaddressable.
+    pub fn interned_schemas(&self) -> &[String] {
+        &self.manifest.schemas
     }
 
     /// Borrow row `i`'s vector directly out of the mapping. No copy, no parse.
@@ -797,9 +823,9 @@ impl VectorStore {
             }
             let line = serde_json::to_vec(&record)?;
             let schema_id = *schema_ids
-                .entry(record.schema_name.clone())
+                .entry(record.schema_identity.clone())
                 .or_insert_with(|| {
-                    schemas.push(record.schema_name.clone());
+                    schemas.push(record.schema_identity.clone());
                     (schemas.len() - 1) as u32
                 });
             let row = RowMeta {

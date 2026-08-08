@@ -78,7 +78,7 @@ fn round_trip_through_the_store_preserves_neural_vectors_exactly() {
     store
         .append(&[PendingOp {
             record: Record {
-                schema_name: "concept".into(),
+                schema_identity: "concept".into(),
                 key_hash: Some("a".into()),
                 key_range: None,
                 fragment_key: "body".into(),
@@ -106,7 +106,7 @@ fn a_neural_store_refuses_a_fixture_vector() {
     store
         .append(&[PendingOp {
             record: Record {
-                schema_name: "concept".into(),
+                schema_identity: "concept".into(),
                 key_hash: Some("a".into()),
                 key_range: None,
                 fragment_key: "body".into(),
