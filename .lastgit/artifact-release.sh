@@ -5,6 +5,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# LastGit runs under launchd, whose minimal PATH does not include rustup's
+# user-local toolchain by default.
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+command -v cargo >/dev/null
+
 if [ "${LASTGIT_CI_CONTEXT:-artifact-release}" != "artifact-release" ]; then
   echo "artifact-release.sh must run as the artifact-release LastGit context" >&2
   exit 2

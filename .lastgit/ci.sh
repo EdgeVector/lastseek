@@ -3,6 +3,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+# LastGit runs under launchd, whose minimal PATH does not include rustup's
+# user-local toolchain by default.
+export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
+command -v cargo >/dev/null
+
 test "$(head -n 1 .last-stack/pr-venue)" = "lastgit"
 test ! -e .github/workflows
 
