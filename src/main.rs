@@ -288,6 +288,8 @@ fn run() -> Result<(), LastSeekError> {
                         "interned_schemas": store.interned_schemas().len(),
                         "ss_unknown_schemas": ss_unknown.len(),
                         "ss_unknown_sample": ss_unknown.iter().take(10).collect::<Vec<_>>(),
+                        "non_searchable_records_skipped": Watermark::load(&dir)
+                            .non_searchable_records_skipped,
                     });
                     println!("{}", serde_json::to_string_pretty(&out)?);
                 }
@@ -407,6 +409,7 @@ fn run() -> Result<(), LastSeekError> {
             let mut applied_records = 0usize;
             let mut applied_tombstones = 0usize;
             let mut ss_unknown_batches = 0usize;
+            let mut non_searchable_records_skipped = 0usize;
             let mut unreadable: Vec<String> = Vec::new();
 
             for path in &files {
@@ -440,6 +443,7 @@ fn run() -> Result<(), LastSeekError> {
                 if out.skipped.is_some() {
                     ss_unknown_batches += 1;
                 }
+                non_searchable_records_skipped += out.non_searchable_records_skipped;
                 if !out.records.is_empty() {
                     let texts: Vec<String> = out.records.iter().map(|r| r.text.clone()).collect();
                     let vectors = emb.embed(&texts)?;
@@ -469,6 +473,7 @@ fn run() -> Result<(), LastSeekError> {
                 }
                 mark.applied_through = name;
                 mark.files_applied += 1;
+                mark.non_searchable_records_skipped += out.non_searchable_records_skipped as u64;
                 if consume {
                     // Best-effort: the incumbent may already have taken it.
                     let _ = std::fs::remove_file(path);
@@ -489,6 +494,9 @@ fn run() -> Result<(), LastSeekError> {
                     "records": applied_records,
                     "tombstones": applied_tombstones,
                     "ss_unknown_batches": ss_unknown_batches,
+                    "non_searchable_records_skipped": non_searchable_records_skipped,
+                    "non_searchable_records_skipped_total":
+                        mark.non_searchable_records_skipped,
                     "unreadable": unreadable,
                     "applied_through": mark.applied_through,
                     "pending_ops": store.pending_ops(),
