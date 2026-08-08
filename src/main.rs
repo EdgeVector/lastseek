@@ -47,6 +47,22 @@ fn flag_value(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// Parse a flag's value as `T`, erroring on a present-but-malformed value
+/// rather than silently falling back to a default — `--k abc` used to fall
+/// back to 20 and `--min-score foo` used to silently disable the floor.
+fn parse_flag<T: std::str::FromStr>(
+    args: &[String],
+    name: &str,
+) -> Result<Option<T>, LastSeekError> {
+    match flag_value(args, name) {
+        Some(v) => v
+            .parse::<T>()
+            .map(Some)
+            .map_err(|_| LastSeekError::Embedder(format!("{name} value {v:?} is not valid"))),
+        None => Ok(None),
+    }
+}
+
 fn flag_values(args: &[String], name: &str) -> Vec<String> {
     let mut out = Vec::new();
     for (i, a) in args.iter().enumerate() {
@@ -141,12 +157,12 @@ fn run() -> Result<(), LastSeekError> {
             let mut emb = embedder()?;
             let q = emb.embed(std::slice::from_ref(&text))?.remove(0);
             let opts = QueryOpts {
-                k: flag_value(&args, "--k").and_then(|v| v.parse().ok()),
+                k: parse_flag(&args, "--k")?,
                 schemas: flag_values(&args, "--schema"),
-                min_score: flag_value(&args, "--min-score").and_then(|v| v.parse().ok()),
+                min_score: parse_flag(&args, "--min-score")?,
                 exact: args.iter().any(|a| a == "--exact").then_some(text),
             };
-            let hits = Searcher::new(&store).search(&q, &opts);
+            let hits = Searcher::new(&store, emb.id())?.search(&q, &opts)?;
             let rows: Vec<_> = hits
                 .iter()
                 .map(|h| {
@@ -177,7 +193,7 @@ fn run() -> Result<(), LastSeekError> {
                 .collect::<Result<_, _>>()?;
             let mut emb = embedder()?;
             let mut store = VectorStore::open(&dir)?;
-            store.set_embedder(emb.id(), emb.dimensions(), emb.is_neural())?;
+            store.bind_embedder(emb.as_ref())?;
             let texts: Vec<String> = records.iter().map(|r| r.text.clone()).collect();
             let vectors = emb.embed(&texts)?;
             let ops: Vec<PendingOp> = records

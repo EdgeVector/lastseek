@@ -27,4 +27,6 @@ pub enum LastSeekError {
     Embedder(String),
     #[error("corrupt generation: {0}")]
     CorruptGeneration(String),
+    #[error("embedder boundary: {0}")]
+    EmbedderBoundary(String),
 }
