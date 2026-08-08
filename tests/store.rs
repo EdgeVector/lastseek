@@ -7,8 +7,32 @@
 use lastseek::embed::{DeterministicEmbedder, Embedder};
 use lastseek::index::{QueryOpts, Searcher};
 use lastseek::store::{PendingOp, Record, VectorStore};
+use lastseek::LastSeekError;
 
 const DIMS: usize = 64;
+
+/// Named stand-in for tests that need an arbitrary embedder identity without
+/// exercising `embed()`.
+struct NamedEmbedder {
+    id: String,
+    dims: usize,
+    is_neural: bool,
+}
+
+impl Embedder for NamedEmbedder {
+    fn id(&self) -> &str {
+        &self.id
+    }
+    fn dimensions(&self) -> usize {
+        self.dims
+    }
+    fn is_neural(&self) -> bool {
+        self.is_neural
+    }
+    fn embed(&mut self, _texts: &[String]) -> Result<Vec<Vec<f32>>, LastSeekError> {
+        unimplemented!("NamedEmbedder is identity-only")
+    }
+}
 
 fn rec(schema: &str, key: &str, text: &str) -> Record {
     Record {
@@ -25,9 +49,7 @@ fn rec(schema: &str, key: &str, text: &str) -> Record {
 fn seed(dir: &std::path::Path, docs: &[(&str, &str, &str)]) -> VectorStore {
     let mut emb = DeterministicEmbedder::new(DIMS);
     let mut store = VectorStore::open(dir).unwrap();
-    store
-        .set_embedder(emb.id(), emb.dimensions(), emb.is_neural())
-        .unwrap();
+    store.bind_embedder(&emb).unwrap();
     let texts: Vec<String> = docs.iter().map(|d| d.2.to_string()).collect();
     let vecs = emb.embed(&texts).unwrap();
     let ops: Vec<PendingOp> = docs
@@ -60,7 +82,10 @@ fn reads_back_from_the_log_before_any_compaction() {
 
     let mut emb = DeterministicEmbedder::new(DIMS);
     let q = emb.embed(&["alpha beta".to_string()]).unwrap().remove(0);
-    let hits = Searcher::new(&store).search(&q, &QueryOpts::default());
+    let hits = Searcher::new(&store, emb.id())
+        .unwrap()
+        .search(&q, &QueryOpts::default())
+        .unwrap();
     assert_eq!(hits.len(), 2);
     assert_eq!(hits[0].record.key_hash.as_deref(), Some("a"));
 }
@@ -175,13 +200,16 @@ fn schema_scope_is_structural_not_a_post_filter() {
         .unwrap()
         .remove(0);
 
-    let scoped = Searcher::new(&store).search(
-        &q,
-        &QueryOpts {
-            schemas: vec!["sop".to_string()],
-            ..Default::default()
-        },
-    );
+    let scoped = Searcher::new(&store, emb.id())
+        .unwrap()
+        .search(
+            &q,
+            &QueryOpts {
+                schemas: vec!["sop".to_string()],
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_eq!(scoped.len(), 1, "scoped search must find the sop row");
     assert_eq!(scoped[0].record.schema_name, "sop");
 }
@@ -201,7 +229,10 @@ fn pending_ops_shadow_committed_rows() {
         }])
         .unwrap();
 
-    let hits = Searcher::new(&store).search(&v, &QueryOpts::default());
+    let hits = Searcher::new(&store, emb.id())
+        .unwrap()
+        .search(&v, &QueryOpts::default())
+        .unwrap();
     assert_eq!(hits.len(), 1, "the same identity must not appear twice");
     assert_eq!(hits[0].record.text, "replaced text");
 
@@ -270,7 +301,13 @@ fn embedder_identity_survives_a_reopen_before_any_compaction() {
     let dir = tempfile::tempdir().unwrap();
     {
         let mut store = VectorStore::open(dir.path()).unwrap();
-        store.set_embedder("some-embedder", DIMS, true).unwrap();
+        store
+            .bind_embedder(&NamedEmbedder {
+                id: "some-embedder".to_string(),
+                dims: DIMS,
+                is_neural: true,
+            })
+            .unwrap();
     }
     let reopened = VectorStore::open(dir.path()).unwrap();
     assert_eq!(reopened.embedder_id(), "some-embedder");
@@ -307,13 +344,16 @@ fn search_touches_the_text_segment_at_most_k_times() {
         .embed(&["record number 42 filler text goes here".to_string()])
         .unwrap()
         .remove(0);
-    let hits = Searcher::new(&reopened).search(
-        &q,
-        &QueryOpts {
-            k: Some(5),
-            ..Default::default()
-        },
-    );
+    let hits = Searcher::new(&reopened, emb.id())
+        .unwrap()
+        .search(
+            &q,
+            &QueryOpts {
+                k: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
     assert_eq!(hits.len(), 5);
     assert!(
         reopened.meta_reads() <= 5,
@@ -372,13 +412,16 @@ fn residency_rss_growth_is_bounded_best_effort() {
         .embed(&["record number 1 lorem ipsum dolor".to_string()])
         .unwrap()
         .remove(0);
-    let _ = Searcher::new(&reopened).search(
-        &q,
-        &QueryOpts {
-            k: Some(5),
-            ..Default::default()
-        },
-    );
+    let _ = Searcher::new(&reopened, emb.id())
+        .unwrap()
+        .search(
+            &q,
+            &QueryOpts {
+                k: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
 
     let Some(after) = rss_kb() else {
         return;
@@ -396,6 +439,113 @@ fn residency_rss_growth_is_bounded_best_effort() {
              RSS by {growth_kb}KB (loose bound {bound_kb}KB) — likely test-binary \
              noise from concurrently running tests, not necessarily a regression"
         );
+    }
+}
+
+#[test]
+fn append_rejects_a_vector_with_the_wrong_dimensions() {
+    // The exact reproduction that used to wedge the store permanently: append
+    // a wrong-dims vector, then discover the damage only at compact() or
+    // query time. It must now be refused at the write itself, and the store
+    // must remain fully usable afterward — never wedged.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = seed(dir.path(), &[("concept", "a", "alpha beta")]);
+
+    let wrong_dims = vec![0.0f32; DIMS * 2];
+    let err = store
+        .append(&[PendingOp {
+            record: rec("concept", "b", "wrong dims"),
+            vector: Some(wrong_dims),
+        }])
+        .unwrap_err();
+    assert!(matches!(err, LastSeekError::DimensionMismatch { .. }));
+
+    // Not wedged: a correctly-dimensioned append and compact still succeed.
+    let mut emb = DeterministicEmbedder::new(DIMS);
+    let v = emb.embed(&["still fine".to_string()]).unwrap().remove(0);
+    store
+        .append(&[PendingOp {
+            record: rec("concept", "c", "still fine"),
+            vector: Some(v),
+        }])
+        .unwrap();
+    store.compact().unwrap();
+    assert_eq!(store.committed_rows(), 2);
+}
+
+#[test]
+fn rebind_a_different_embedder_on_a_non_empty_store_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = seed(dir.path(), &[("concept", "a", "alpha beta")]);
+
+    let err = store
+        .bind_embedder(&NamedEmbedder {
+            id: "other-embedder".to_string(),
+            dims: DIMS,
+            is_neural: false,
+        })
+        .unwrap_err();
+    assert!(matches!(err, LastSeekError::EmbedderBoundary(_)));
+
+    let err = store
+        .bind_embedder(&NamedEmbedder {
+            id: "deterministic-test-fixture".to_string(),
+            dims: DIMS * 2,
+            is_neural: false,
+        })
+        .unwrap_err();
+    assert!(matches!(err, LastSeekError::EmbedderBoundary(_)));
+}
+
+#[test]
+fn fixture_vector_into_a_neural_manifest_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = VectorStore::open(dir.path()).unwrap();
+    let neural = NamedEmbedder {
+        id: "all-MiniLM-L6-v2".to_string(),
+        dims: DIMS,
+        is_neural: true,
+    };
+    store.bind_embedder(&neural).unwrap();
+    store
+        .append(&[PendingOp {
+            record: rec("concept", "a", "real"),
+            vector: Some(vec![0.1; DIMS]),
+        }])
+        .unwrap();
+
+    let fixture = DeterministicEmbedder::new(DIMS);
+    let err = store.bind_embedder(&fixture).unwrap_err();
+    assert!(matches!(err, LastSeekError::EmbedderBoundary(_)));
+}
+
+#[test]
+fn neural_vector_into_a_fixture_manifest_is_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = seed(dir.path(), &[("concept", "a", "alpha beta")]);
+
+    let neural = NamedEmbedder {
+        id: "all-MiniLM-L6-v2".to_string(),
+        dims: DIMS,
+        is_neural: true,
+    };
+    let err = store.bind_embedder(&neural).unwrap_err();
+    assert!(matches!(err, LastSeekError::EmbedderBoundary(_)));
+}
+
+#[test]
+fn query_with_a_mismatched_embedder_id_errors_instead_of_returning_empty() {
+    // A store queried with the wrong embedder must not return a confident
+    // empty hit list — that is indistinguishable from "no matches" and is
+    // exactly the silent-success pattern this boundary exists to prevent.
+    let dir = tempfile::tempdir().unwrap();
+    let mut store = seed(dir.path(), &[("concept", "a", "alpha beta")]);
+    store.compact().unwrap();
+
+    match Searcher::new(&store, "some-other-embedder") {
+        Err(LastSeekError::EmbedderBoundary(_)) => {}
+        Err(e) => panic!("expected EmbedderBoundary, got {e:?}"),
+        Ok(_) => panic!("expected Err, got Ok"),
     }
 }
 
@@ -445,9 +595,7 @@ mod fault_injection {
             let dir = tempfile::tempdir().unwrap();
             let mut emb = DeterministicEmbedder::new(DIMS);
             let mut store = VectorStore::open(dir.path()).unwrap();
-            store
-                .set_embedder(emb.id(), emb.dimensions(), emb.is_neural())
-                .unwrap();
+            store.bind_embedder(&emb).unwrap();
             let texts: Vec<String> = docs.iter().map(|d| d.2.to_string()).collect();
             let vecs = emb.embed(&texts).unwrap();
             let ops: Vec<PendingOp> = docs
@@ -470,13 +618,16 @@ mod fault_injection {
             let mut checker = DeterministicEmbedder::new(DIMS);
             for d in &docs {
                 let q = checker.embed(&[d.2.to_string()]).unwrap().remove(0);
-                let hits = Searcher::new(&reopened).search(
-                    &q,
-                    &QueryOpts {
-                        exact: Some(d.2.to_string()),
-                        ..Default::default()
-                    },
-                );
+                let hits = Searcher::new(&reopened, checker.id())
+                    .unwrap()
+                    .search(
+                        &q,
+                        &QueryOpts {
+                            exact: Some(d.2.to_string()),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
                 assert_eq!(
                     hits.len(),
                     1,

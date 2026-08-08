@@ -53,6 +53,7 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 
+use crate::embed::Embedder;
 use crate::LastSeekError;
 
 pub const MANIFEST_VERSION: u32 = 2;
@@ -530,9 +531,27 @@ impl VectorStore {
     }
 
     /// Append mutations to the log. O(changed), never O(corpus).
+    ///
+    /// Every vector's length is checked against the bound embedder's
+    /// dimensionality **before** it reaches the log. A wedge that used to be
+    /// merely detected later (at compaction, or as a silently truncated
+    /// search) is now unrepresentable: a mixed-dimension store can no longer
+    /// be built in the first place.
     pub fn append(&mut self, ops: &[PendingOp]) -> Result<(), LastSeekError> {
         if ops.is_empty() {
             return Ok(());
+        }
+        if self.manifest.dimensions != 0 {
+            for op in ops {
+                if let Some(v) = &op.vector {
+                    if v.len() != self.manifest.dimensions {
+                        return Err(LastSeekError::DimensionMismatch {
+                            expected: self.manifest.dimensions,
+                            got: v.len(),
+                        });
+                    }
+                }
+            }
         }
         let _guard = lock_writer(&self.dir)?;
         let f = OpenOptions::new()
@@ -799,20 +818,58 @@ impl VectorStore {
         Ok(())
     }
 
-    /// Record the embedder identity. Durable immediately via a small sidecar
+    /// Bind the embedder identity. Durable immediately via a small sidecar
     /// (there may be no generation directory yet to carry it), and carried
     /// forward into every future generation's manifest by `compact()`.
-    pub fn set_embedder(
-        &mut self,
-        id: &str,
-        dims: usize,
-        is_neural: bool,
-    ) -> Result<(), LastSeekError> {
+    ///
+    /// This is a boundary, not documentation: once the store holds any data
+    /// (committed rows or a pending log), rebinding a different id or a
+    /// different dimensionality is refused outright — that mismatch is what
+    /// let a store accept vectors it could never consistently search or
+    /// compact again.
+    ///
+    /// Neural and fixture embedders are also mutually exclusive once bound:
+    /// `manifest.embedder_is_neural` permanently marks a fixture-built store,
+    /// and a fixture can only bind onto an already-neural store with an
+    /// explicit `LASTSEEK_ALLOW_FIXTURE=1` opt-in (there is no opt-in the
+    /// other way — a fixture-marked store never legitimately gains real
+    /// vectors).
+    pub fn bind_embedder(&mut self, embedder: &dyn Embedder) -> Result<(), LastSeekError> {
+        let id = embedder.id();
+        let dims = embedder.dimensions();
+        let is_neural = embedder.is_neural();
+        let already_bound = !self.manifest.embedder_id.is_empty();
+        let has_data = self.manifest.rows > 0 || !self.pending.is_empty();
+
+        if already_bound && has_data {
+            if self.manifest.embedder_id != id || self.manifest.dimensions != dims {
+                return Err(LastSeekError::EmbedderBoundary(format!(
+                    "store is bound to embedder {:?} (dims={}); refusing to rebind to {:?} \
+                     (dims={}) with data already present",
+                    self.manifest.embedder_id, self.manifest.dimensions, id, dims
+                )));
+            }
+            if self.manifest.embedder_is_neural != is_neural {
+                if is_neural {
+                    return Err(LastSeekError::EmbedderBoundary(format!(
+                        "store is permanently fixture-marked (embedder {:?}); refusing to bind \
+                         neural embedder {id:?}",
+                        self.manifest.embedder_id
+                    )));
+                }
+                if std::env::var("LASTSEEK_ALLOW_FIXTURE").as_deref() != Ok("1") {
+                    return Err(LastSeekError::EmbedderBoundary(format!(
+                        "store holds neural vectors (embedder {:?}); refusing to bind fixture \
+                         embedder {id:?} without LASTSEEK_ALLOW_FIXTURE=1",
+                        self.manifest.embedder_id
+                    )));
+                }
+            }
+        }
+
         self.manifest.embedder_id = id.to_string();
         self.manifest.embedder_is_neural = is_neural;
-        if self.manifest.dimensions == 0 {
-            self.manifest.dimensions = dims;
-        }
+        self.manifest.dimensions = dims;
         let sidecar = serde_json::json!({
             "embedder_id": self.manifest.embedder_id,
             "dimensions": self.manifest.dimensions,

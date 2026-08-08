@@ -20,6 +20,7 @@
 //! from `VectorStore` in isolation.
 
 use crate::store::{id_hash, PendingOp, Record, VectorStore};
+use crate::LastSeekError;
 use std::collections::HashSet;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -68,8 +69,20 @@ pub struct Searcher<'a> {
 }
 
 impl<'a> Searcher<'a> {
-    pub fn new(store: &'a VectorStore) -> Self {
-        Self { store }
+    /// Bind a searcher to `store`, refusing a querying embedder that does not
+    /// match the one the store was built with. A query embedded with the
+    /// wrong embedder is not a corpus with zero matches — it is a config
+    /// error, and returning an empty hit list for it is exactly the
+    /// confident-but-wrong answer this boundary exists to prevent.
+    pub fn new(store: &'a VectorStore, embedder_id: &str) -> Result<Self, LastSeekError> {
+        if !store.embedder_id().is_empty() && store.embedder_id() != embedder_id {
+            return Err(LastSeekError::EmbedderBoundary(format!(
+                "store is bound to embedder {:?}; refusing to query it with embedder {:?}",
+                store.embedder_id(),
+                embedder_id
+            )));
+        }
+        Ok(Self { store })
     }
 
     /// Score `query` against the corpus and return the best `k`.
@@ -77,7 +90,14 @@ impl<'a> Searcher<'a> {
     /// Reads vectors and row metadata straight out of their mappings and
     /// touches a record's text only for rows that survive into the result
     /// set.
-    pub fn search(&self, query: &[f32], opts: &QueryOpts) -> Vec<Hit> {
+    pub fn search(&self, query: &[f32], opts: &QueryOpts) -> Result<Vec<Hit>, LastSeekError> {
+        let dims = self.store.dimensions();
+        if dims != 0 && query.len() != dims {
+            return Err(LastSeekError::DimensionMismatch {
+                expected: dims,
+                got: query.len(),
+            });
+        }
         let k = opts.k.unwrap_or(20).max(1);
         let min = opts.min_score.unwrap_or(f32::NEG_INFINITY);
         let scoped = !opts.schemas.is_empty();
@@ -154,7 +174,7 @@ impl<'a> Searcher<'a> {
                 .then_with(|| self.id_hash_of(&a.1).cmp(&self.id_hash_of(&b.1)))
         });
 
-        scored
+        Ok(scored
             .into_iter()
             .filter_map(|(score, r)| {
                 let record = self.record_of(&r)?;
@@ -165,7 +185,7 @@ impl<'a> Searcher<'a> {
                 None => true,
             })
             .take(k)
-            .collect()
+            .collect())
     }
 
     fn record_of(&self, r: &ScoredRef) -> Option<Record> {
