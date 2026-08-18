@@ -307,3 +307,171 @@ fn coverage_is_reported_when_explicitly_requested() {
     ]);
     assert_eq!(status["coverage"]["available"], true);
 }
+
+/// The regression that made this test file's harness dangerous to use.
+///
+/// On 2026-08-17 a scheduled owner run typed `lastseek drain --help` to read
+/// the flag list. The CLI scanned for flags it knew and silently discarded the
+/// rest, so `drain` RAN — with its default `--max-files 2000`, against the live
+/// inbox — applying 1,234 batch files and 903 records to the primary index and
+/// advancing the watermark, exit 0. It happened twice in three runs; the second
+/// run had read the warning and was avoiding it, because `--help` does not read
+/// as a flag you choose to type.
+///
+/// The bar is byte-identical, not "mostly harmless": help must be answered
+/// before any side effect exists to measure.
+#[test]
+fn help_on_a_mutating_verb_prints_usage_and_touches_nothing() {
+    let root = tempfile::tempdir().unwrap();
+    let inbox = root.path().join("inbox");
+    let home = root.path().join("index");
+    std::fs::create_dir_all(&inbox).unwrap();
+    std::fs::write(
+        inbox.join("1786150242984_a.json"),
+        r#"{"schema_name":"s","changes":[{"mutation_id":"m","kind":"upsert",
+            "key_value":{"hash":"k","range":null},
+            "fields_and_values":{"body":"must not be indexed by a help request"}}]}"#,
+    )
+    .unwrap();
+    let home_arg = home.to_string_lossy().to_string();
+    let inbox_arg = inbox.to_string_lossy().to_string();
+
+    for args in [
+        vec![
+            "drain", "--home", &home_arg, "--inbox", &inbox_arg, "--help",
+        ],
+        vec!["drain", "--home", &home_arg, "--inbox", &inbox_arg, "-h"],
+        vec![
+            "drain",
+            "--home",
+            &home_arg,
+            "--inbox",
+            &inbox_arg,
+            "--consume",
+            "--help",
+        ],
+        vec!["compact", "--home", &home_arg, "--help"],
+    ] {
+        let out = Command::new(env!("CARGO_BIN_EXE_lastseek"))
+            .args(&args)
+            .env("LASTSEEK_EMBEDDER", "deterministic")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{args:?} should exit 0");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains("usage") || stdout.starts_with("lastseek "),
+            "{args:?} printed no usage: {stdout}"
+        );
+        assert!(
+            !stdout.contains("\"applied_through\"") && !stdout.contains("\"folded_ops\""),
+            "{args:?} EXECUTED THE VERB: {stdout}"
+        );
+        // The store was never created, so nothing was written at all.
+        assert!(!home.exists(), "{args:?} created the store directory");
+        // And the batch file the drain would have consumed is still there.
+        assert!(inbox.join("1786150242984_a.json").exists());
+    }
+}
+
+/// `--limit` is the flag brain and kanban both spell by muscle memory, and the
+/// one this CLI does not have. It used to return the default 20 and exit 0 —
+/// silent under-return to a recall-sensitive consumer.
+#[test]
+fn an_unrecognized_flag_is_refused_by_name_instead_of_ignored() {
+    let root = tempfile::tempdir().unwrap();
+    let home_arg = root.path().join("index").to_string_lossy().to_string();
+    let out = Command::new(env!("CARGO_BIN_EXE_lastseek"))
+        .args(["status", "--home", &home_arg, "--limit", "50"])
+        .env("LASTSEEK_EMBEDDER", "deterministic")
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "an unknown flag must not exit 0");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("--limit"), "names the flag: {stderr}");
+    assert!(stderr.contains("status"), "names the verb: {stderr}");
+    assert!(
+        out.stdout.is_empty(),
+        "nothing on stdout, so a caller parsing JSON sees a clean failure"
+    );
+}
+
+/// Freshness is the signal `remaining` could never carry: `remaining` is files
+/// left after a bounded pass, so a tick slow enough to absorb its own interval
+/// always reports zero however stale the corpus is.
+#[test]
+fn status_reports_how_far_behind_the_applied_corpus_is() {
+    let root = tempfile::tempdir().unwrap();
+    let inbox = root.path().join("inbox");
+    let home = root.path().join("index");
+    std::fs::create_dir_all(&inbox).unwrap();
+
+    let home_arg = home.to_string_lossy().to_string();
+    let inbox_arg = inbox.to_string_lossy().to_string();
+
+    // Nothing applied yet: absent, NOT zero. "fresh" and "unknown" are
+    // different answers and a consumer deciding whether to trust a semantic
+    // read depends on telling them apart.
+    let fresh = run(&["status", "--home", &home_arg]);
+    assert!(fresh["freshness_lag_ms"].is_null());
+
+    // A batch stamped 2023-11-14, so the lag is unambiguously large and does
+    // not depend on how long the test took to run.
+    std::fs::write(
+        inbox.join("1700000000000_old.json"),
+        r#"{"schema_name":"s","searchable_fields":["body"],"changes":[
+            {"mutation_id":"m","kind":"upsert","key_value":{"hash":"k","range":null},
+             "fields_and_values":{"body":"stale"}}]}"#,
+    )
+    .unwrap();
+    // A second batch that stays queued, so `--queue` has something to count.
+    std::fs::write(
+        inbox.join("9700000000000_future.json"),
+        r#"{"schema_name":"s","changes":[]}"#,
+    )
+    .unwrap();
+
+    run(&[
+        "drain",
+        "--home",
+        &home_arg,
+        "--inbox",
+        &inbox_arg,
+        "--max-files",
+        "1",
+    ]);
+
+    let status = run(&["status", "--home", &home_arg, "--inbox", &inbox_arg]);
+    let lag = status["freshness_lag_ms"].as_u64().expect("a lag");
+    assert!(
+        lag > 60_000_000_000,
+        "a batch from 2023 must read as years behind, got {lag}"
+    );
+    // The queue costs a directory read, so it stays opt-in and says so.
+    assert_eq!(status["queue"]["available"], false);
+
+    let queued = run(&[
+        "status", "--home", &home_arg, "--inbox", &inbox_arg, "--queue",
+    ]);
+    assert_eq!(queued["queue"]["pending"], 1);
+    // The file the watermark names is the last one APPLIED, not one skipped.
+    assert_eq!(queued["queue"]["stranded_below_watermark"], 0);
+
+    // A batch that lands with a timestamp BELOW the watermark is invisible to
+    // the drain forever — `pending_batches` selects `name > applied_through`,
+    // and `remaining` only ever looks forward, so nothing reports it. This is
+    // the live 17-file band on the primary host, reproduced.
+    std::fs::write(
+        inbox.join("1600000000000_late_arrival.json"),
+        r#"{"schema_name":"s","changes":[]}"#,
+    )
+    .unwrap();
+    let stranded = run(&[
+        "status", "--home", &home_arg, "--inbox", &inbox_arg, "--queue",
+    ]);
+    assert_eq!(stranded["queue"]["stranded_below_watermark"], 1);
+    assert_eq!(
+        stranded["queue"]["pending"], 1,
+        "a stranded file must not be counted as queued work"
+    );
+}
