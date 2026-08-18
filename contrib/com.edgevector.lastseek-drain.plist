@@ -1,0 +1,76 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Keeps the LastSeek semantic index current.
+
+  Zero LLM, no network, no writes to LastDB. One bounded `lastseek drain`
+  (+ `compact` only when something was applied) every 5 minutes, logging what
+  it left behind to ~/.lastseek/drain.log.
+
+  Why a timer at all: the index answers whether or not it is fresh, so a
+  stopped drain does not fail — it quietly serves a corpus that no longer
+  exists. Nothing else surfaces that.
+
+  Why bounded: an unbounded drain over a large backlog wrote 549.80 GB in
+  twenty minutes on 2026-08-07 and took the machine down.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.edgevector.lastseek-drain</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>exec "$HOME/.lastseek/bin/lastseek-drain-tick"</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>300</integer>
+
+  <!-- The tick logs its own outcome; launchd's stdio only needs to catch a
+       failure to start at all. -->
+  <key>StandardOutPath</key>
+  <string>/Users/tomtang/.lastseek/launchd.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/tomtang/.lastseek/launchd.log</string>
+
+  <!--
+    NOT `Background`, and this is measured rather than preferred.
+
+    `ProcessType: Background` + `Nice` confines the job to efficiency cores on
+    Apple Silicon. A/B on an identical 100-file slice of the live inbox, same
+    binary, minutes apart on 2026-08-17:
+
+        default QoS      7.4 s wall   611% CPU    74 ms/file
+        taskpolicy -b  132.0 s wall   135% CPU  1.32 s /file
+
+    17.8x on wall time and 3.8x on CPU-seconds. Contention was ruled out: a
+    foreground probe took 6.3 cores while the throttled live drain was running
+    and that drain held 0.37 — it was fenced, not starved.
+
+    The fence spent ~65x of headroom to hold a ~780 files/h workload
+    permanently at its edge. On 2026-08-17 arrivals crossed it: ticks/hour fell
+    from 8-11 to 1, the `--max-files` cap bound for the first time in eight
+    days, and `brain ask` — which is tier-0 LastSeek — was served from a corpus
+    30-59 minutes stale while every tick reported `remaining=0`.
+
+    `LowPriorityIO` is KEPT. The measurement above cannot separate its cost
+    from the QoS clamp's, and disk politeness is the half that protects other
+    work on a shared machine. If lag persists after this change, isolating
+    `LowPriorityIO` is the next measurement — not a guess.
+
+    What protects the machine is the BOUND, not the fence: `--max-files` plus
+    the tick's own lock. The 2026-08-07 incident that took the host down was an
+    UNBOUNDED drain, and it would have taken the host down just as thoroughly
+    on efficiency cores.
+  -->
+  <key>ProcessType</key>
+  <string>Standard</string>
+  <key>LowPriorityIO</key>
+  <true/>
+
+  <key>RunAtLoad</key>
+  <false/>
+</dict>
+</plist>

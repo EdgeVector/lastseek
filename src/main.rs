@@ -341,6 +341,19 @@ fn run() -> Result<(), LastSeekError> {
         print!("{USAGE}");
         return Ok(());
     };
+
+    // Check the whole argument vector BEFORE resolving anything or touching a
+    // store. `--help` on a verb prints that verb's usage and executes nothing,
+    // and an unrecognized flag is refused by name rather than ignored. See
+    // src/cli.rs for what typing `lastseek drain --help` used to do.
+    match lastseek::cli::check(&args)? {
+        lastseek::cli::Invocation::Help(usage) => {
+            print!("{usage}");
+            return Ok(());
+        }
+        lastseek::cli::Invocation::Run => {}
+    }
+
     let dir = home(&args);
 
     match cmd.as_str() {
@@ -529,10 +542,45 @@ fn run() -> Result<(), LastSeekError> {
                             "schemas": [],
                         }),
                     };
+                    // FRESHNESS, from the watermark alone — no node call, no
+                    // directory walk. `remaining` cannot express this: it is
+                    // "files left after this bounded pass", so a tick slow
+                    // enough to absorb its own interval always empties the
+                    // inbox and always reports zero. On 2026-08-17 all 2,132
+                    // logged ticks reported `remaining=0` while `brain ask`
+                    // was served from a corpus 30-59 minutes stale. Any fix to
+                    // ingest throughput is unverifiable without this field, and
+                    // the next regression is equally silent without it.
+                    let mark = Watermark::load(&dir);
+                    let lag = lastseek::ingest::freshness_lag_ms(&mark.applied_through);
+                    let queue = if args.iter().any(|a| a == "--queue") {
+                        let inbox = flag_value(&args, "--inbox")
+                            .map(std::path::PathBuf::from)
+                            .unwrap_or_else(lastseek::ingest::default_inbox);
+                        Some(lastseek::ingest::queue_stats(
+                            &inbox,
+                            &mark.applied_through,
+                        )?)
+                    } else {
+                        None
+                    };
                     let out = serde_json::json!({
                         "ok": true,
                         "state": state,
                         "home": dir.to_string_lossy(),
+                        // Absent, never zero, when nothing has been applied or
+                        // the watermark carries no time prefix — "fresh" and
+                        // "unknown" are different answers.
+                        "freshness_lag_ms": lag,
+                        "applied_through": mark.applied_through,
+                        "files_applied": mark.files_applied,
+                        "queue": match queue {
+                            Some(q) => serde_json::to_value(q)?,
+                            None => serde_json::json!({
+                                "available": false,
+                                "reason": "not requested — the queue reads the inbox directory, which has held 127k entries on this host; pass --queue",
+                            }),
+                        },
                         "needs_rebuild": false,
                         "embedder_id": store.embedder_id(),
                         "dimensions": store.dimensions(),
@@ -550,8 +598,7 @@ fn run() -> Result<(), LastSeekError> {
                         "interned_schemas": store.interned_schemas().len(),
                         "ss_unknown_schemas": ss_unknown.len(),
                         "ss_unknown_sample": ss_unknown.iter().take(10).collect::<Vec<_>>(),
-                        "non_searchable_records_skipped": Watermark::load(&dir)
-                            .non_searchable_records_skipped,
+                        "non_searchable_records_skipped": mark.non_searchable_records_skipped,
                         "coverage": coverage_json,
                     });
                     println!("{}", serde_json::to_string_pretty(&out)?);

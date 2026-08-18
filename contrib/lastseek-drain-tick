@@ -1,0 +1,145 @@
+#!/usr/bin/env bash
+# Keep the LastSeek index current. Zero LLM, no network, no node writes.
+#
+# The host's outbox sink writes an IndexChangeBatch per mutation into
+# {LASTDB_HOME}/apps/search/inbox/. Without something applying them the index
+# freezes at whatever it held when it was built, and — because a stale index
+# still answers — it goes on answering from a corpus that no longer exists.
+# That silence is the failure mode: nothing surfaces "your search results are
+# two weeks old".
+#
+# Bounded on purpose. `lastseek drain` caps the files it applies and reports
+# `remaining`; this wrapper does one bounded pass per tick and logs what it
+# left behind. An unbounded drain over a large backlog wrote 549.80 GB in
+# twenty minutes on 2026-08-07 and took the machine down.
+#
+# CONSUMES the batches it applies, since 2026-08-08.
+#
+# It did not, originally, so the incumbent Search app could keep reading the
+# same inbox until it was retired. Measured: the incumbent does not read it. Its
+# index was last written 2026-08-07 12:53 and reports 2% coverage, and nothing
+# on this host drains it — no LaunchAgent, no routine. So the files were being
+# retained for a consumer that does not consume, and the inbox had grown to
+# 4,638 files / 745 MB and was rising.
+#
+# That is the same unbounded-inbox failure the semantic-plane milestone was
+# created about (99k files, undrained for a week), with a new cause. Retaining
+# for a dead reader is not caution; it is the leak.
+#
+# If the incumbent is ever revived as a real fallback it needs its own drain,
+# and that drain needs its own cursor — not this one's leftovers.
+set -uo pipefail
+
+# `~/.local/bin` FIRST, and this directory is deliberately NOT on the path.
+#
+# It used to lead, back when `lastseek` was a hand-built binary living here.
+# Host Track now owns `~/.local/bin/lastseek` and points it at the CI-published
+# artifact, so leading with this directory would have pinned the drain to a
+# stale local build indefinitely — a binary with no freshness gate, silently
+# preferred over the managed one, on the one job that runs unattended forever.
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+LOG="$HOME/.lastseek/drain.log"
+MAX_FILES="${LASTSEEK_DRAIN_MAX_FILES:-500}"
+LOCKDIR="$HOME/.lastseek/drain.lock.d"
+
+mkdir -p "$(dirname "$LOG")"
+ts() { date -u +%FT%TZ; }
+
+# One drain at a time, so ticks cannot pile up behind a slow pass. `lastseek`
+# takes its own cross-process writer lock, so concurrency would block rather
+# than corrupt — this only keeps the queue from growing.
+#
+# `mkdir` because it is the one atomic test-and-set that exists everywhere:
+# macOS has no `flock(1)`, and depending on a tool that might be missing turns
+# "cannot lock" into "never runs".
+if ! mkdir "$LOCKDIR" 2>/dev/null; then
+  # Reap a lock whose owner died, so a crashed pass does not wedge the timer
+  # forever. 30 minutes is far longer than any bounded pass takes.
+  if [ -n "$(find "$LOCKDIR" -maxdepth 0 -mmin +30 2>/dev/null)" ]; then
+    rm -rf "$LOCKDIR"
+    mkdir "$LOCKDIR" 2>/dev/null || exit 0
+    printf '%s reaped-stale-lock\n' "$(ts)" >> "$LOG"
+  else
+    printf '%s skip already-running\n' "$(ts)" >> "$LOG"
+    exit 0
+  fi
+fi
+trap 'rm -rf "$LOCKDIR"' EXIT
+
+out="$(lastseek drain --max-files "$MAX_FILES" --consume 2>&1)"
+rc=$?
+if [ $rc -ne 0 ]; then
+  printf '%s drain-failed rc=%s %s\n' "$(ts)" "$rc" "$(printf '%s' "$out" | tr '\n' ' ' | cut -c1-400)" >> "$LOG"
+  exit 0   # never fail the timer; the next tick retries
+fi
+
+files=$(printf '%s' "$out" | /usr/bin/sed -n 's/.*"files": *\([0-9]*\).*/\1/p' | head -1)
+remaining=$(printf '%s' "$out" | /usr/bin/sed -n 's/.*"remaining": *\([0-9]*\).*/\1/p' | head -1)
+records=$(printf '%s' "$out" | /usr/bin/sed -n 's/.*"records": *\([0-9]*\).*/\1/p' | head -1)
+
+# Compact when enough has accumulated to be worth a slab rewrite, OR when the
+# log has been carried long enough.
+#
+# The threshold used to be `-gt 0`, which 1,697 of 2,018 logged ticks (84%)
+# cleared. The comment above it correctly named write amplification as "the
+# exact cost this store exists to avoid" and then set the guard to the smallest
+# non-zero value available, so it guarded nothing: compaction REWRITES THE
+# WHOLE SLAB, so folding one changed record rewrote the entire corpus. Measured
+# at 18 compactions in 1h46m on a 59 MB generation ~= 12.5 GiB/day of SSD
+# writes, growing linearly with the corpus, forever.
+#
+# Batching is free. Measured on a copy-on-write clone of the real index:
+#
+#     pending ops folded    compact wall    CPU
+#                      1         0.37 s    0.12 s
+#                  5,500         0.32 s    0.21 s
+#
+# Zero marginal cost per record. And carrying the log costs almost nothing on
+# the read side, which is the only thing a threshold trades against:
+#
+#     pending ops    log size    lastseek query
+#               0         0 B            0.10 s
+#           5,500     27.7 MB            0.14 s
+#
+# +40 ms worst case, against the 1.8-2.1 s board reads the same consumers
+# already make. So a threshold in the low thousands cuts write volume ~99% and
+# costs nothing anyone can perceive.
+#
+# The age backstop exists because a threshold alone would let a quiet period
+# carry an un-folded log indefinitely: the log is replayed on open, so an
+# unbounded one eventually costs startup time and leaves more work to redo
+# after a crash.
+MIN_OPS="${LASTSEEK_COMPACT_MIN_OPS:-2000}"
+MAX_AGE_S="${LASTSEEK_COMPACT_MAX_AGE_S:-3600}"
+STAMP="$HOME/.lastseek/last-compact.stamp"
+
+pending=$(printf '%s' "$out" | /usr/bin/sed -n 's/.*"pending_ops": *\([0-9]*\).*/\1/p' | head -1)
+now=$(date +%s)
+last=$(cat "$STAMP" 2>/dev/null || echo 0)
+case "$last" in ''|*[!0-9]*) last=0 ;; esac
+age=$(( now - last ))
+
+compacted=0
+if [ "${pending:-0}" -ge "$MIN_OPS" ] || { [ "${pending:-0}" -gt 0 ] && [ "$age" -ge "$MAX_AGE_S" ]; }; then
+  if lastseek compact >/dev/null 2>&1; then
+    compacted=1
+    printf '%s' "$now" > "$STAMP"
+  fi
+fi
+
+# `lag` is the field that makes this log readable. `remaining` cannot answer
+# "is the index current": it is files left after THIS bounded pass, so a tick
+# slow enough to absorb its own StartInterval always empties the inbox and
+# always reports zero, however far behind it is. All 2,132 ticks logged before
+# 2026-08-17 reported `remaining=0`; the index was 30-59 minutes stale.
+lag=$(lastseek status 2>/dev/null | /usr/bin/sed -n 's/.*"freshness_lag_ms": *\([0-9]*\).*/\1/p' | head -1)
+
+printf '%s ok files=%s records=%s remaining=%s pending=%s compacted=%s lag_ms=%s\n' \
+  "$(ts)" "${files:-0}" "${records:-0}" "${remaining:-0}" "${pending:-0}" \
+  "$compacted" "${lag:-unknown}" >> "$LOG"
+
+# Keep the log bounded — it ticks all day forever.
+if [ "$(wc -l < "$LOG" 2>/dev/null || echo 0)" -gt 5000 ]; then
+  tail -2000 "$LOG" > "$LOG.tmp" && mv "$LOG.tmp" "$LOG"
+fi

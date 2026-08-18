@@ -303,6 +303,115 @@ pub fn default_inbox() -> PathBuf {
     Path::new(&home).join("apps").join("search").join("inbox")
 }
 
+/// The epoch-millisecond prefix of a batch filename.
+///
+/// Batch files are named `<epoch_ms>_<uuid>.json`, which is what makes the
+/// watermark a total order. The same prefix is the only clock LastSeek has for
+/// how old the work it has applied is — the host writes the file when it
+/// captures the mutation, so `now - prefix` is the age of the newest change in
+/// the index, without asking the node anything.
+pub fn batch_epoch_ms(name: &str) -> Option<u64> {
+    name.split('_').next()?.parse::<u64>().ok()
+}
+
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// How far behind the node the applied corpus is, in milliseconds.
+///
+/// `None` when nothing has been applied yet, or when the watermark does not
+/// carry a parseable time prefix — reported as absent rather than as zero,
+/// because "fresh" and "unknown" are different answers and a consumer deciding
+/// whether to trust a semantic read depends on telling them apart.
+///
+/// # Why this field exists
+///
+/// It is the signal `remaining` could never be. `remaining` is "files left
+/// after this bounded pass", so a drain tick slow enough to absorb its own
+/// interval always empties the inbox and always reports zero — however far
+/// behind it is. Measured on 2026-08-17: every one of 2,132 logged ticks
+/// reported `remaining=0` while the index served `brain ask` from a corpus
+/// 30–59 minutes stale.
+pub fn freshness_lag_ms(applied_through: &str) -> Option<u64> {
+    let applied = batch_epoch_ms(applied_through)?;
+    Some(now_epoch_ms().saturating_sub(applied))
+}
+
+/// Inbox backlog, for the opt-in `--queue` half of `status`.
+#[derive(Debug, Clone, Serialize)]
+pub struct QueueStats {
+    /// Batch files strictly after the watermark — real work still to apply.
+    pub pending: usize,
+    /// Age of the oldest such file. This is the lag a consumer will still be
+    /// served once the current pass finishes, so it is the forward-looking
+    /// number where `freshness_lag_ms` is the current one.
+    pub oldest_pending_age_ms: Option<u64>,
+    /// Files strictly BELOW the watermark that are still on disk. The drain
+    /// selects `name > applied_through`, so it will never look at these again
+    /// — they are stranded, not queued, and are counted apart rather than
+    /// folded into `pending`.
+    ///
+    /// Only meaningful for a drain that runs `--consume`, which is what the
+    /// host tick does: without it, every applied file legitimately remains and
+    /// this counts the whole applied history. The file exactly AT the
+    /// watermark is the last one applied and is never counted.
+    ///
+    /// On the primary host this reads 17 — a band of batches from
+    /// 2026-08-16T04:01Z that a rewound watermark skipped past, invisible to
+    /// `remaining` because `remaining` only ever looks forward.
+    pub stranded_below_watermark: usize,
+}
+
+/// Count the inbox without reading any batch body.
+///
+/// Kept opt-in behind `--queue`: this is one `read_dir`, but the plane clients
+/// in brain and kanban call `lastseek status` to decide whether the plane is
+/// available, and a directory that has held 127,000 entries on this host is not
+/// something a health check should walk on every semantic query. A health check
+/// has to be cheaper than the thing it checks.
+pub fn queue_stats(inbox: &Path, after: &str) -> Result<QueueStats, LastSeekError> {
+    if !inbox.is_dir() {
+        return Ok(QueueStats {
+            pending: 0,
+            oldest_pending_age_ms: None,
+            stranded_below_watermark: 0,
+        });
+    }
+    let now = now_epoch_ms();
+    let mut pending = 0usize;
+    let mut stranded = 0usize;
+    let mut oldest: Option<u64> = None;
+    for entry in std::fs::read_dir(inbox)? {
+        let entry = entry?;
+        let name = entry.file_name().to_string_lossy().to_string();
+        if !name.ends_with(".json") || name.starts_with('.') {
+            continue;
+        }
+        // `== after` is the file the watermark names — the last one applied,
+        // not something skipped.
+        if name.as_str() == after {
+            continue;
+        }
+        if name.as_str() < after {
+            stranded += 1;
+            continue;
+        }
+        pending += 1;
+        if let Some(ms) = batch_epoch_ms(&name) {
+            oldest = Some(oldest.map_or(ms, |o: u64| o.min(ms)));
+        }
+    }
+    Ok(QueueStats {
+        pending,
+        oldest_pending_age_ms: oldest.map(|ms| now.saturating_sub(ms)),
+        stranded_below_watermark: stranded,
+    })
+}
+
 /// Batch files strictly after `after`, in order, at most `max` of them.
 ///
 /// Returns `(files, remaining)`. `remaining` is what the cap left behind, so a

@@ -7,6 +7,7 @@
 //! The index is regenerable from LastDB at any time, which is what lets the
 //! on-disk format stay simple and unreplicated.
 
+pub mod cli;
 pub mod coverage;
 pub mod embed;
 pub mod index;
@@ -43,4 +44,26 @@ pub enum LastSeekError {
     /// corpora.
     #[error("unknown schema {name:?}; known names include: {}", known.join(", "))]
     UnknownSchema { name: String, known: Vec<String> },
+    /// A flag the verb does not read.
+    ///
+    /// Deliberately an error rather than a silent skip, and deliberately
+    /// modelled on the same distinction as `UnknownSchema`: a caller who
+    /// mistypes a flag must not receive the answer a caller who omitted it
+    /// would get. The scanning parser this replaced ignored the flag, ran the
+    /// verb, and exited 0 — which on `drain --help` meant applying 1,234 batch
+    /// files to the primary index instead of printing usage.
+    #[error(
+        "flag is not accepted by {verb}: {flag}. Run 'lastseek {verb} --help' for the flags this \
+         verb accepts ({})",
+        known.join(", ")
+    )]
+    UnknownFlag {
+        flag: String,
+        verb: String,
+        known: Vec<String>,
+    },
+    #[error("{flag} needs a value; run 'lastseek {verb} --help'")]
+    MissingFlagValue { flag: String, verb: String },
+    #[error("{verb} takes no argument {arg:?}; run 'lastseek {verb} --help'")]
+    UnexpectedArgument { arg: String, verb: String },
 }
