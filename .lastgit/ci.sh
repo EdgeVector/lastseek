@@ -8,12 +8,12 @@ cd "$(dirname "$0")/.."
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 command -v cargo >/dev/null
 
-test "$(head -n 1 .last-stack/pr-venue)" = "lastgit"
+test "$(head -n 1 .last-stack/pr-venue)" = "forgejo"
 test ! -e .github/workflows
 
 # Product boundary: LastSeek runs outside Mini and stores nothing durable that
 # LastDB owns. These greps fail loudly if that framing is edited away.
-grep -q "lastdb:///lastseek" README.md
+grep -q "http://localhost:3300/EdgeVector/lastseek.git" README.md
 grep -q "outside Mini" README.md
 grep -q "local-only and regenerable" README.md
 grep -q "not CloudSync product data" README.md

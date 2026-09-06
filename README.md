@@ -1,7 +1,7 @@
 # LastSeek
 
 Memory-mapped semantic vector search for LastDB. Canonical remote
-`lastdb:///lastseek` (LastGit).
+`http://localhost:3300/EdgeVector/lastseek.git` (LastGit).
 
 LastSeek runs **outside Mini**, so a default `lastdbd` ships no model weights
 and no inference runtime. The index is **local-only and regenerable** from
