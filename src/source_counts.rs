@@ -127,10 +127,7 @@ impl SourceCounts {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let tmp = path.with_extension("json.lastseek-tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        crate::store::write_private_atomic(path, &serde_json::to_vec_pretty(self)?)
     }
 
     pub fn get(&self, identity: &str) -> Option<&DeclaredCount> {

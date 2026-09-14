@@ -234,11 +234,19 @@ fn pending_ops_shadow_committed_rows() {
         .search(&v, &QueryOpts::default())
         .unwrap();
     assert_eq!(hits.len(), 1, "the same identity must not appear twice");
-    assert_eq!(hits[0].record.text, "replaced text");
+    // The pending value won: the replaced vector scores 1.0 against itself,
+    // the original would not. (Text is not retained, so the vector is the
+    // observable that tells the two apart.)
+    assert!(
+        (hits[0].score - 1.0).abs() < 1e-5,
+        "pending op must shadow the committed row, score {}",
+        hits[0].score
+    );
 
     store.compact().unwrap();
     assert_eq!(store.committed_rows(), 1);
-    assert_eq!(store.record_at(0).unwrap().text, "replaced text");
+    assert_eq!(store.vector_at(0).unwrap(), v.as_slice());
+    assert_eq!(store.record_at(0).unwrap().key_hash.as_deref(), Some("a"));
 }
 
 #[test]
@@ -709,23 +717,23 @@ mod fault_injection {
                 let q = checker.embed(&[d.2.to_string()]).unwrap().remove(0);
                 let hits = Searcher::new(&reopened, checker.id())
                     .unwrap()
-                    .search(
-                        &q,
-                        &QueryOpts {
-                            exact: Some(d.2.to_string()),
-                            ..Default::default()
-                        },
-                    )
+                    .search(&q, &QueryOpts::default())
                     .unwrap();
+                let same_identity = hits
+                    .iter()
+                    .filter(|h| h.record.key_hash.as_deref() == Some(d.1))
+                    .count();
                 assert_eq!(
-                    hits.len(),
-                    1,
+                    same_identity, 1,
                     "fault at {point:?} (crashed={crashed}): identity {:?} must \
-                     appear exactly once after reopen, found {}",
-                    d,
-                    hits.len()
+                     appear exactly once after reopen, found {same_identity}",
+                    d
                 );
-                assert_eq!(hits[0].record.text, d.2);
+                // Its own vector ranks it first with a perfect score: the
+                // slab row and the identity line still describe the same
+                // document (the desync this matrix exists to catch).
+                assert_eq!(hits[0].record.key_hash.as_deref(), Some(d.1));
+                assert!((hits[0].score - 1.0).abs() < 1e-5);
                 assert_eq!(hits[0].record.schema_identity, d.0);
             }
         }

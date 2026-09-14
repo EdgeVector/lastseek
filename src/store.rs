@@ -17,13 +17,33 @@
 //!   parsed or copied. Scoring reads straight out of the mapping, so the OS
 //!   page cache decides residency instead of the process. Resident set tracks
 //!   the working set, not the corpus.
-//! - **Text and identity** live in a separate segment, touched only for records
-//!   that actually make the result set. This is the load-bearing split: text is
-//!   ~4x the bytes of a vector, so keeping it out of the scan means a query
-//!   reads a few bytes per candidate instead of the whole record.
+//! - **Identity** lives in a separate segment (`meta.jsonl`), touched only for
+//!   records that actually make the result set. This is the load-bearing
+//!   split: scoring reads a few bytes per candidate instead of the whole row.
 //!
 //! Writes append to a log and are folded into the slab by compaction, so a
 //! flush costs O(changed) rather than O(corpus).
+//!
+//! # What is on disk, and what is not
+//!
+//! The index holds **vectors and record identity only**. The text a record
+//! was embedded from is never written — not to the pending log, not to a
+//! generation (`Record::text` is `skip_serializing`). A query answers with
+//! keys and scores; the caller point-fetches the body it is entitled to from
+//! LastDB, which is encrypted at rest and reachable only over its socket.
+//! Until 2026-09 the index kept a full copy of every body in a world-readable
+//! `meta.jsonl`, which put credential material that LastDB protects at `0600`
+//! into a `0644` file that any local process could read and any semantic
+//! query would echo (`papercut-lastseek-serves-credential-material-from-a-world-readable-plaintext-corpus`).
+//! Two rules now hold, and `tests/store.rs` proves both across compactions:
+//!
+//! - No artifact under the store root is group- or world-readable. Every
+//!   directory is created `0700` and every file `0600`, set **at creation
+//!   time in the writer** — never by a later `chmod`, because compaction
+//!   replaces the generation directory on most ticks and a post-hoc chmod
+//!   would be undone by the next one.
+//! - No artifact under the store root, and no query response, carries a
+//!   record body.
 //!
 //! # Generations (crash-safe compaction)
 //!
@@ -130,6 +150,19 @@ pub struct Record {
     pub key_hash: Option<String>,
     pub key_range: Option<String>,
     pub fragment_key: String,
+    /// The text that was embedded. **Ingest-only, never persisted.**
+    ///
+    /// `skip_serializing` is the whole of the fix for
+    /// `papercut-lastseek-serves-credential-material-from-a-world-readable-plaintext-corpus`:
+    /// every path that writes a `Record` to disk — the pending log, a
+    /// generation's `meta.jsonl` — goes through serde, so no on-disk artifact
+    /// can carry a record body. LastSeek is a disposable projection of LastDB
+    /// (keys + vectors), not a second record store
+    /// (`preference-search-is-disposable-vector-projection`); a caller that
+    /// wants the body point-fetches the record it is entitled to from LastDB,
+    /// which is encrypted at rest and socket-gated. `default` keeps old logs
+    /// and generations that still carry `text` loadable.
+    #[serde(default, skip_serializing)]
     pub text: String,
     pub mutation_id: Option<String>,
     /// Tombstone on the pending log only. Compaction drops deleted rows
@@ -174,6 +207,19 @@ pub struct Manifest {
     pub rows_bytes: u64,
     #[serde(default)]
     pub meta_bytes: u64,
+    /// Whether this generation's `meta.jsonl` still carries record bodies.
+    /// Every generation written since `Record::text` stopped serializing
+    /// says `false`. A manifest without the field predates that change and
+    /// is read as `true`, which is what makes `compact()` rewrite a quiet
+    /// store once, so a body-bearing generation does not outlive the binary
+    /// that stopped producing them.
+    #[serde(default = "manifest_bodies_retained_default")]
+    pub bodies_retained: bool,
+}
+
+/// Missing field ⇒ a pre-fix generation, which did retain bodies.
+fn manifest_bodies_retained_default() -> bool {
+    true
 }
 
 impl Default for Manifest {
@@ -189,6 +235,8 @@ impl Default for Manifest {
             vectors_bytes: 0,
             rows_bytes: 0,
             meta_bytes: 0,
+            // Generation 0 has no meta.jsonl, so there is nothing to purge.
+            bodies_retained: false,
         }
     }
 }
@@ -349,13 +397,102 @@ impl Drop for WriterLock {
 }
 
 fn lock_writer(dir: &Path) -> Result<WriterLock, LastSeekError> {
-    let f = OpenOptions::new()
+    let f = private_open_options()
         .create(true)
         .truncate(false)
         .write(true)
         .open(dir.join(LOCK_FILE))?;
     fs2::FileExt::lock_exclusive(&f)?;
     Ok(WriterLock(f))
+}
+
+/// Owner-only mode for every directory the store creates.
+pub const PRIVATE_DIR_MODE: u32 = 0o700;
+/// Owner-only mode for every file the store creates.
+pub const PRIVATE_FILE_MODE: u32 = 0o600;
+
+/// `OpenOptions` that create files owner-readable only.
+///
+/// The mode is set at create time, in the writer, on purpose: a generation
+/// directory is replaced by compaction on most drain ticks, so a `chmod`
+/// applied to a live path is undone minutes later by the next generation
+/// inheriting the process umask again. The store used to be created that way,
+/// and on 2026-08-17 the live `meta.jsonl` was `0644` while the LastDB store
+/// it projects is `0600`. The invariant this enforces: no LastSeek artifact
+/// may be more readable than the LastDB store it is derived from.
+///
+/// `mode` only applies when the file is created; an existing file keeps its
+/// mode. Every file this store writes is either created fresh inside a new
+/// staging directory or lives under the store root, which `open()` tightens.
+fn private_open_options() -> OpenOptions {
+    let mut opts = OpenOptions::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(PRIVATE_FILE_MODE);
+    }
+    opts
+}
+
+/// `File::create` with the owner-only mode applied at creation.
+fn create_private(path: &Path) -> Result<File, LastSeekError> {
+    Ok(private_open_options()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(path)?)
+}
+
+/// `create_dir_all` whose leaf (and any parent it has to create) is
+/// owner-only. An already-existing directory keeps its mode here; `open()`
+/// tightens the store root explicitly.
+pub(crate) fn create_private_dir_all(path: &Path) -> Result<(), LastSeekError> {
+    let mut b = std::fs::DirBuilder::new();
+    b.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(PRIVATE_DIR_MODE);
+    }
+    b.create(path)?;
+    Ok(())
+}
+
+/// Clamp an existing path to owner-only. Used on the store root at open so a
+/// store created by an older binary (root `0755`, generations `0644`) stops
+/// being world-readable the first time the fixed binary touches it, before
+/// any compaction has had a chance to replace its files.
+fn tighten_private(path: &Path, mode: u32) -> Result<(), LastSeekError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let current = std::fs::metadata(path)?.permissions().mode() & 0o777;
+        if current != mode {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))?;
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+    Ok(())
+}
+
+/// Atomic owner-only write: tmp file created at `0600`, fsynced, renamed
+/// over `path`. `std::fs::write` would create the file at the umask. Shared
+/// with the sidecars other modules keep under the store root (the drain
+/// watermark) so every file there goes through one writer.
+pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), LastSeekError> {
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".lastseek-tmp");
+    let tmp = PathBuf::from(tmp);
+    {
+        let mut f = create_private(&tmp)?;
+        f.write_all(bytes)?;
+        durable_sync(&f)?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 /// `File::sync_all`, counted under `fault-injection` so the compaction fault
@@ -406,7 +543,12 @@ pub struct VectorStore {
 impl VectorStore {
     pub fn open(dir: impl AsRef<Path>) -> Result<Self, LastSeekError> {
         let dir = dir.as_ref().to_path_buf();
-        std::fs::create_dir_all(&dir)?;
+        create_private_dir_all(&dir)?;
+        // A root created by an older binary is `0755`, and everything inside
+        // it (old generations, a leftover pending log) inherits that. Clamp
+        // the root itself, which is the one path compaction never replaces,
+        // so nothing under it is reachable by another user from this open on.
+        tighten_private(&dir, PRIVATE_DIR_MODE)?;
 
         // A pre-generations (v1) store has a top-level manifest.json and no
         // CURRENT pointer. Refuse it explicitly rather than misreading it as
@@ -667,7 +809,7 @@ impl VectorStore {
             }
         }
         let _guard = lock_writer(&self.dir)?;
-        let f = OpenOptions::new()
+        let f = private_open_options()
             .create(true)
             .append(true)
             .open(self.dir.join(LOG_FILE))?;
@@ -701,7 +843,12 @@ impl VectorStore {
         // only what was in memory would silently drop that op when the log
         // is removed at the end of this call.
         let pending = load_pending(&self.dir)?;
-        if pending.is_empty() {
+        // A quiet store is still rewritten once when its current generation
+        // was built by a binary that persisted record bodies: the only way a
+        // body-bearing `meta.jsonl` leaves disk is a compaction that writes
+        // the next generation without them, and a store that receives no new
+        // ops would otherwise keep the old one forever.
+        if pending.is_empty() && !self.manifest.bodies_retained {
             return Ok(());
         }
 
@@ -775,7 +922,7 @@ impl VectorStore {
 
         let current_tmp = self.dir.join(format!("{CURRENT_FILE}.tmp"));
         {
-            let mut f = File::create(&current_tmp)?;
+            let mut f = create_private(&current_tmp)?;
             f.write_all(new_generation.to_string().as_bytes())?;
             durable_sync(&f)?;
         }
@@ -808,11 +955,11 @@ impl VectorStore {
         dims: usize,
         new_generation: u64,
     ) -> Result<(), LastSeekError> {
-        std::fs::create_dir_all(staging)?;
+        create_private_dir_all(staging)?;
 
-        let vectors_f = File::create(staging.join(VECTORS_FILE))?;
-        let rows_f = File::create(staging.join(ROWS_FILE))?;
-        let meta_f = File::create(staging.join(META_FILE))?;
+        let vectors_f = create_private(&staging.join(VECTORS_FILE))?;
+        let rows_f = create_private(&staging.join(ROWS_FILE))?;
+        let meta_f = create_private(&staging.join(META_FILE))?;
         let mut vw = BufWriter::new(&vectors_f);
         let mut rw = BufWriter::new(&rows_f);
         let mut mw = BufWriter::new(&meta_f);
@@ -903,8 +1050,9 @@ impl VectorStore {
             vectors_bytes: (rows * dims * 4) as u64,
             rows_bytes: (rows * ROW_WIDTH) as u64,
             meta_bytes: meta_off,
+            bodies_retained: false,
         };
-        let mf = File::create(staging.join(MANIFEST_FILE))?;
+        let mf = create_private(&staging.join(MANIFEST_FILE))?;
         serde_json::to_writer_pretty(&mf, &manifest)?;
         durable_sync(&mf)?;
 
@@ -988,9 +1136,9 @@ impl VectorStore {
             "dimensions": self.manifest.dimensions,
             "embedder_is_neural": self.manifest.embedder_is_neural,
         });
-        std::fs::write(
-            self.dir.join(EMBEDDER_FILE),
-            serde_json::to_vec_pretty(&sidecar)?,
+        write_private_atomic(
+            &self.dir.join(EMBEDDER_FILE),
+            &serde_json::to_vec_pretty(&sidecar)?,
         )?;
         Ok(())
     }

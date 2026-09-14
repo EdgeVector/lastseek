@@ -103,16 +103,21 @@ Currently an alias for `status`. Same flags.
     VerbSpec {
         verb: "query",
         usage: "\
-lastseek query <text> [--home DIR] [--k N] [--schema S]... [--min-score F] [--exact]
+lastseek query <text> [--home DIR] [--k N] [--schema S]... [--min-score F]
+
+Answers record keys and scores. The index retains no record text, so a
+response never carries a body: point-fetch the record from LastDB by key.
 
   --k N          number of results (default 20). NOT --limit.
   --schema S     repeatable. Accepts a readable name (Card), an identity hash,
                  or a registry name. A name that resolves to nothing is an
                  ERROR, not an empty result — those are different answers.
   --min-score F  drop hits below this score
-  --exact        require the query text to appear verbatim
+  --exact        REFUSED (exit 1): substring matching needs retained text.
 ",
         value_flags: &["--table", "--k", "--schema", "--min-score"],
+        // `--exact` stays a recognised flag so the refusal names the reason
+        // instead of the generic unknown-flag message.
         bool_flags: &["--exact"],
         positionals: 1,
     },

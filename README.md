@@ -26,14 +26,35 @@ LastSeek separates the two things those costs came from.
 | | |
 |---|---|
 | `vectors.f32` | one contiguous `f32` slab, memory-mapped, never parsed or copied |
-| `meta.jsonl` | identity + text, touched **only for rows that make the result set** |
+| `meta.jsonl` | record identity (schema, key, fragment), touched **only for rows that make the result set** |
 | `pending.jsonl` | append-only log; a flush costs O(changed), not O(corpus) |
 | `manifest.json` | dims, embedder id, row count |
 
-Keeping text out of the scan is the load-bearing split: text is roughly 4x the
-bytes of a vector, so a query reads ~1.5 KB per candidate rather than ~7 KB.
-Because vectors are mapped rather than loaded, the OS page cache decides
-residency and resident memory tracks the working set instead of the corpus.
+Keeping identity out of the scan is the load-bearing split: scoring reads a
+32-byte row per candidate, never a JSON line. Because vectors are mapped rather
+than loaded, the OS page cache decides residency and resident memory tracks the
+working set instead of the corpus.
+
+## The index holds keys and vectors, never bodies
+
+LastSeek is a disposable projection of LastDB, not a second record store. The
+text a record was embedded from is used once, at ingest, and is **never written
+to disk** — not to the pending log, not to a generation. A query answers with
+record keys and scores; the caller point-fetches the body it is entitled to
+from LastDB, which is encrypted at rest and reachable only over its socket.
+`--exact` (substring match on retained text) is refused for the same reason.
+
+Every directory the store creates is `0700` and every file `0600`, set at
+creation time in the writer. A `chmod` on a live path would not do: compaction
+replaces the generation directory on most drain ticks, and the next one would
+inherit the process umask again. The invariant is that no LastSeek artifact is
+more readable than the LastDB store it projects. `tests/no_bodies.rs` drives
+the real binary under `umask 000` across two compactions and asserts both
+halves — no body on disk or in a response, nothing group/world-readable.
+
+A store written before this rule carries bodies in its current generation. The
+first `compact` the fixed binary runs rewrites that generation without them,
+even when nothing is pending, and `open` clamps the store root to `0700`.
 
 Scoring is a linear pass. That is the right default while a scan is fast; an
 approximate index adds recall risk and build cost, so it should arrive when the

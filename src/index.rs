@@ -14,10 +14,15 @@
 //!
 //! The scan itself never touches `meta.jsonl`: candidate scoring, the
 //! tombstone check and the schema-scope check all read out of `rows.bin`
-//! (`RowMeta`), which is fixed-width and mmap'd. A record's text is parsed
-//! only for rows that survive sorting into the final `k`, which is what makes
-//! the store's residency property observable from `Searcher` rather than just
-//! from `VectorStore` in isolation.
+//! (`RowMeta`), which is fixed-width and mmap'd. A record's identity line is
+//! parsed only for rows that survive sorting into the final `k`, which is
+//! what makes the store's residency property observable from `Searcher`
+//! rather than just from `VectorStore` in isolation.
+//!
+//! A hit carries identity and score, never text: the index does not retain
+//! record bodies (see `store` module doc). There is consequently no exact
+//! substring mode here — a caller that needs one hydrates the hits from
+//! LastDB and filters what it is entitled to read.
 
 use crate::schema::{ResolvedScope, SchemaTable};
 use crate::store::{id_hash, PendingOp, Record, VectorStore};
@@ -41,8 +46,6 @@ pub struct QueryOpts {
     /// never a silently dropped filter term.
     pub schemas: Vec<String>,
     pub min_score: Option<f32>,
-    /// Keep only hits whose text contains the query, case-insensitively.
-    pub exact: Option<String>,
 }
 
 /// Cosine similarity for L2-normalised vectors, which is their dot product.
@@ -124,8 +127,8 @@ impl<'a> Searcher<'a> {
     /// Score `query` against the corpus and return the best `k`.
     ///
     /// Reads vectors and row metadata straight out of their mappings and
-    /// touches a record's text only for rows that survive into the result
-    /// set.
+    /// touches a record's identity line only for rows that survive into the
+    /// result set.
     pub fn search(&self, query: &[f32], opts: &QueryOpts) -> Result<Vec<Hit>, LastSeekError> {
         let dims = self.store.dimensions();
         if dims != 0 && query.len() != dims {
@@ -164,13 +167,6 @@ impl<'a> Searcher<'a> {
             shadowed.insert(id_hash(&op.record.id()));
         }
 
-        // `--exact` stays structural: a candidate must pass it to occupy a
-        // heap slot at all, so a low-scoring exact match can still displace
-        // a higher-scoring non-match. The text read that requires is paid
-        // only for candidates that clear the current heap's score bar (see
-        // `consider`), not for every row in the corpus.
-        let exact = opts.exact.as_ref().map(|q| q.to_lowercase());
-
         // Bounded top-k: a min-heap capped at size k, so ranking the corpus
         // costs O(n log k) instead of sorting all n scored candidates.
         let mut heap: BinaryHeap<Candidate> = BinaryHeap::with_capacity(k + 1);
@@ -197,14 +193,7 @@ impl<'a> Searcher<'a> {
             if s < min {
                 continue;
             }
-            self.consider(
-                &mut heap,
-                k,
-                s,
-                row.id_hash,
-                ScoredRef::Committed(i),
-                &exact,
-            );
+            self.consider(&mut heap, k, s, row.id_hash, ScoredRef::Committed(i));
         }
 
         for (j, op) in self.store.pending().iter().enumerate() {
@@ -229,7 +218,7 @@ impl<'a> Searcher<'a> {
                 continue;
             }
             let idh = id_hash(&op.record.id());
-            self.consider(&mut heap, k, s, idh, ScoredRef::Pending(j), &exact);
+            self.consider(&mut heap, k, s, idh, ScoredRef::Pending(j));
         }
 
         // Deterministic order: score desc, then identity hash, so equal
@@ -246,7 +235,7 @@ impl<'a> Searcher<'a> {
         Ok(winners
             .into_iter()
             .filter_map(|c| {
-                let record = c.record.or_else(|| self.record_of(&c.r))?;
+                let record = self.record_of(&c.r)?;
                 Some(Hit {
                     score: c.score,
                     record,
@@ -256,11 +245,8 @@ impl<'a> Searcher<'a> {
     }
 
     /// Admit `r` into the bounded top-k heap if it beats the current worst
-    /// kept candidate (or the heap isn't full yet). When `--exact` is set,
-    /// the text read and match check happen here — only for candidates that
-    /// clear the score bar — so a non-matching high scorer never pays for a
-    /// text read it doesn't need, and a matching low scorer still gets a
-    /// fair look for as long as a heap slot is contested.
+    /// kept candidate (or the heap isn't full yet). Nothing here reads
+    /// `meta.jsonl`; hydration happens once, for the final `k`, in `search`.
     fn consider(
         &self,
         heap: &mut BinaryHeap<Candidate>,
@@ -268,7 +254,6 @@ impl<'a> Searcher<'a> {
         score: f32,
         id_hash: u64,
         r: ScoredRef,
-        exact: &Option<String>,
     ) {
         let in_contention = heap.len() < k
             || heap
@@ -281,28 +266,10 @@ impl<'a> Searcher<'a> {
             return;
         }
 
-        let record = match exact {
-            Some(q) => {
-                let Some(record) = self.record_of(&r) else {
-                    return;
-                };
-                if !record.text.to_lowercase().contains(q) {
-                    return;
-                }
-                Some(record)
-            }
-            None => None,
-        };
-
         if heap.len() >= k {
             heap.pop();
         }
-        heap.push(Candidate {
-            score,
-            id_hash,
-            r,
-            record,
-        });
+        heap.push(Candidate { score, id_hash, r });
     }
 
     fn record_of(&self, r: &ScoredRef) -> Option<Record> {
@@ -322,13 +289,11 @@ enum ScoredRef {
     Pending(usize),
 }
 
-/// One kept top-k slot. `record` caches the text read from an `--exact`
-/// check so the final hydration pass never reads a row's text twice.
+/// One kept top-k slot.
 struct Candidate {
     score: f32,
     id_hash: u64,
     r: ScoredRef,
-    record: Option<Record>,
 }
 
 impl PartialEq for Candidate {

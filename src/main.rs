@@ -20,7 +20,8 @@ lastseek — memory-mapped semantic vector search for LastDB
 
 usage:
   lastseek status [--home DIR]
-  lastseek query <text> [--home DIR] [--k N] [--schema S]... [--min-score F] [--exact]
+  lastseek query <text> [--home DIR] [--k N] [--schema S]... [--min-score F]
+                                      answers keys + scores; bodies stay in LastDB
   lastseek add [--home DIR]           read Records as JSONL on stdin, embed, append
   lastseek compact [--home DIR]       fold the pending log into the slab
   lastseek drain [--home DIR] [--inbox DIR] [--max-files N] [--consume]
@@ -631,6 +632,19 @@ fn run() -> Result<(), LastSeekError> {
             if text.is_empty() {
                 return Err(LastSeekError::Embedder("query requires text".into()));
             }
+            // `--exact` filtered hits on their retained text. The index no
+            // longer retains text, so the flag is refused with the reason
+            // rather than silently ignored: a caller that got the same
+            // answer with and without it would be misled about the filter.
+            // brain treats a non-zero `lastseek query` as "plane
+            // unavailable" and ranks with its incumbent, which still does
+            // substring matching over records it hydrates itself.
+            if args.iter().any(|a| a == "--exact") {
+                return Err(LastSeekError::Embedder(
+                    "--exact is not supported: the index retains keys and vectors only,                      not record text; hydrate the hits from LastDB and filter there"
+                        .into(),
+                ));
+            }
             let store = VectorStore::open(&dir)?;
             let table = load_schema_table(&args);
             let mut emb = embedder_for(store.embedder_id())?;
@@ -639,7 +653,6 @@ fn run() -> Result<(), LastSeekError> {
                 k: parse_flag(&args, "--k")?,
                 schemas: flag_values(&args, "--schema"),
                 min_score: parse_flag(&args, "--min-score")?,
-                exact: args.iter().any(|a| a == "--exact").then_some(text),
             };
             let searcher = Searcher::new(&store, emb.id())?.with_schema_table(table.clone());
             let hits = searcher.search(&q, &opts)?;
@@ -658,7 +671,9 @@ fn run() -> Result<(), LastSeekError> {
                         "key_hash": h.record.key_hash,
                         "key_range": h.record.key_range,
                         "fragment_key": h.record.fragment_key,
-                        "text": h.record.text,
+                        // No `text`: the index does not retain record
+                        // bodies, so a response cannot echo one. Callers
+                        // point-fetch by key from LastDB.
                     })
                 })
                 .collect();

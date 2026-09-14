@@ -275,13 +275,11 @@ impl Watermark {
             .unwrap_or_default()
     }
 
+    /// Lives under the store root, so it is written the way every other
+    /// file there is: owner-only at creation, never at the umask.
     pub fn save(&self, home: &Path) -> Result<(), LastSeekError> {
-        std::fs::create_dir_all(home)?;
-        let path = Self::path(home);
-        let tmp = path.with_extension("json.lastseek-tmp");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(&tmp, &path)?;
-        Ok(())
+        crate::store::create_private_dir_all(home)?;
+        crate::store::write_private_atomic(&Self::path(home), &serde_json::to_vec_pretty(self)?)
     }
 }
 
