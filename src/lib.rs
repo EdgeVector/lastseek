@@ -12,6 +12,7 @@ pub mod coverage;
 pub mod embed;
 pub mod index;
 pub mod ingest;
+pub mod metrics;
 pub mod schema;
 pub mod source_counts;
 pub mod store;

@@ -9,6 +9,7 @@ use lastseek::coverage::{CoverageReport, DEFAULT_COVERAGE_FLOOR};
 use lastseek::embed::{DeterministicEmbedder, Embedder};
 use lastseek::index::{QueryOpts, Searcher};
 use lastseek::ingest::Watermark;
+use lastseek::metrics::{self, LastDrain, QUERY_TIMEOUT_MS};
 use lastseek::schema::{SchemaTable, AVAILABLE_PATH, DEFAULT_SCHEMA_SERVICE_URL};
 use lastseek::source_counts::SourceCounts;
 use lastseek::store::{PendingOp, Record, VectorStore};
@@ -554,6 +555,7 @@ fn run() -> Result<(), LastSeekError> {
                     // the next regression is equally silent without it.
                     let mark = Watermark::load(&dir);
                     let lag = lastseek::ingest::freshness_lag_ms(&mark.applied_through);
+                    let query_metrics = metrics::query_summary(&dir);
                     let queue = if args.iter().any(|a| a == "--queue") {
                         let inbox = flag_value(&args, "--inbox")
                             .map(std::path::PathBuf::from)
@@ -573,6 +575,10 @@ fn run() -> Result<(), LastSeekError> {
                         // the watermark carries no time prefix — "fresh" and
                         // "unknown" are different answers.
                         "freshness_lag_ms": lag,
+                        "query_count": query_metrics.query_count,
+                        "p95_ms": query_metrics.p95_ms,
+                        "timeout_count": query_metrics.timeout_count,
+                        "last_drain": serde_json::to_value(metrics::last_drain(&dir))?,
                         "applied_through": mark.applied_through,
                         "files_applied": mark.files_applied,
                         "queue": match queue {
@@ -624,6 +630,7 @@ fn run() -> Result<(), LastSeekError> {
             }
         }
         "query" => {
+            let started = std::time::Instant::now();
             let text = args
                 .get(1)
                 .cloned()
@@ -656,6 +663,8 @@ fn run() -> Result<(), LastSeekError> {
             };
             let searcher = Searcher::new(&store, emb.id())?.with_schema_table(table.clone());
             let hits = searcher.search(&q, &opts)?;
+            let elapsed_ms = started.elapsed().as_millis() as u64;
+            metrics::record_query(&dir, elapsed_ms, elapsed_ms >= QUERY_TIMEOUT_MS)?;
             let rows: Vec<_> = hits
                 .iter()
                 .map(|h| {
@@ -805,6 +814,15 @@ fn run() -> Result<(), LastSeekError> {
                 }
             }
             mark.save(&dir)?;
+            metrics::save_last_drain(
+                &dir,
+                &LastDrain {
+                    files: files.len() as u64,
+                    records: applied_records as u64,
+                    tombstones: applied_tombstones as u64,
+                    compacted: false,
+                },
+            )?;
 
             println!(
                 "{}",
@@ -832,6 +850,9 @@ fn run() -> Result<(), LastSeekError> {
             let mut store = VectorStore::open(&dir)?;
             let before = store.pending_ops();
             store.compact()?;
+            if before > 0 {
+                metrics::mark_last_drain_compacted(&dir)?;
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({

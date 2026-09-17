@@ -177,6 +177,16 @@ So `state` is one of:
 `unknown` is deliberately not `healthy`: "no app declared a denominator" and
 "every schema is covered" are different facts.
 
+## Operator metrics stay local
+
+Plain `lastseek status` reports `query_count`, `p95_ms`, and `timeout_count`
+from a durable 256-sample ring under the LastSeek home. The ring stores only
+query duration and timeout state. It never stores query text or record bodies.
+
+The same status response reports the last bounded drain under `last_drain`:
+`files`, `records`, `tombstones`, and `compacted`. `freshness_lag_ms` comes from
+the local drain watermark. These metrics do not scan LastDB or write to it.
+
 ## Ingest: a push feed and an app-driven backfill — no scan
 
 LastDB is Dynamo-shaped: point get, range under one hash, **no scan**. So
