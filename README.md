@@ -180,8 +180,12 @@ So `state` is one of:
 ## Operator metrics stay local
 
 Plain `lastseek status` reports `query_count`, `p95_ms`, and `timeout_count`
-from a durable 256-sample ring under the LastSeek home. The ring stores only
-query duration and timeout state. It never stores query text or record bodies.
+from a durable 256-sample ring under the LastSeek home. It also reports these
+values under `callers`, grouped by a stable label. Use `--caller C` or
+`LASTSEEK_CALLER` for direct callers. Labels keep letters, numbers, `.`, `_`,
+`/`, and `-`, and have a 64-character limit. The ring stores only query
+duration, timeout state, and the caller label. It never stores query text or
+record bodies.
 
 The same status response reports the last bounded drain under `last_drain`:
 `files`, `records`, `tombstones`, and `compacted`. `freshness_lag_ms` comes from

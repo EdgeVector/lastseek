@@ -5,6 +5,7 @@
 
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs::{self, File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -13,6 +14,7 @@ use crate::LastSeekError;
 
 pub const QUERY_RING_CAPACITY: usize = 256;
 pub const QUERY_TIMEOUT_MS: u64 = 1_000;
+const MAX_CALLER_LEN: usize = 64;
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 struct QueryMetricsFile {
@@ -24,6 +26,8 @@ struct QueryMetricsFile {
 struct QuerySample {
     ms: u64,
     timeout: bool,
+    #[serde(default = "default_caller")]
+    caller: String,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -39,6 +43,46 @@ pub struct QuerySummary {
     pub query_count: usize,
     pub p95_ms: u64,
     pub timeout_count: usize,
+    pub callers: Vec<CallerSummary>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct CallerSummary {
+    pub caller: String,
+    pub query_count: usize,
+    pub p95_ms: u64,
+    pub timeout_count: usize,
+}
+
+fn default_caller() -> String {
+    "unknown".to_string()
+}
+
+/// Keep attribution useful without allowing argv, paths, or query text to
+/// create unbounded metric labels.
+pub fn normalize_caller(raw: Option<&str>) -> String {
+    let mut caller: String = raw
+        .unwrap_or("unknown")
+        .trim()
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '/' | '-'))
+        .take(MAX_CALLER_LEN)
+        .collect();
+    if caller.is_empty() {
+        caller = default_caller();
+    }
+    caller
+}
+
+fn p95_ms(samples: &[&QuerySample]) -> u64 {
+    let mut durations: Vec<u64> = samples.iter().map(|sample| sample.ms).collect();
+    durations.sort_unstable();
+    if durations.is_empty() {
+        0
+    } else {
+        let rank = (durations.len() * 95).div_ceil(100).max(1) - 1;
+        durations[rank]
+    }
 }
 
 fn query_metrics_path(home: &Path) -> PathBuf {
@@ -120,12 +164,18 @@ fn load_file<T: for<'de> Deserialize<'de> + Default>(path: &Path) -> T {
         .unwrap_or_default()
 }
 
-pub fn record_query(home: &Path, elapsed_ms: u64, timeout: bool) -> Result<(), LastSeekError> {
+pub fn record_query(
+    home: &Path,
+    elapsed_ms: u64,
+    timeout: bool,
+    caller: &str,
+) -> Result<(), LastSeekError> {
     with_lock(home, &query_metrics_lock_path(home), || {
         let mut metrics: QueryMetricsFile = load_file(&query_metrics_path(home));
         metrics.samples.push(QuerySample {
             ms: elapsed_ms,
             timeout,
+            caller: normalize_caller(Some(caller)),
         });
         if metrics.samples.len() > QUERY_RING_CAPACITY {
             let first = metrics.samples.len() - QUERY_RING_CAPACITY;
@@ -140,22 +190,32 @@ pub fn record_query(home: &Path, elapsed_ms: u64, timeout: bool) -> Result<(), L
 
 pub fn query_summary(home: &Path) -> QuerySummary {
     let metrics: QueryMetricsFile = load_file(&query_metrics_path(home));
-    let mut durations: Vec<u64> = metrics.samples.iter().map(|sample| sample.ms).collect();
-    durations.sort_unstable();
-    let p95_ms = if durations.is_empty() {
-        0
-    } else {
-        let rank = (durations.len() * 95).div_ceil(100).max(1) - 1;
-        durations[rank]
-    };
+    let samples: Vec<&QuerySample> = metrics.samples.iter().collect();
+    let mut by_caller: BTreeMap<&str, Vec<&QuerySample>> = BTreeMap::new();
+    for sample in &samples {
+        by_caller
+            .entry(sample.caller.as_str())
+            .or_default()
+            .push(sample);
+    }
+    let callers = by_caller
+        .into_iter()
+        .map(|(caller, samples)| CallerSummary {
+            caller: caller.to_string(),
+            query_count: samples.len(),
+            p95_ms: p95_ms(&samples),
+            timeout_count: samples.iter().filter(|sample| sample.timeout).count(),
+        })
+        .collect();
     QuerySummary {
-        query_count: metrics.samples.len(),
-        p95_ms,
+        query_count: samples.len(),
+        p95_ms: p95_ms(&samples),
         timeout_count: metrics
             .samples
             .iter()
             .filter(|sample| sample.timeout)
             .count(),
+        callers,
     }
 }
 
@@ -189,22 +249,36 @@ mod tests {
     fn summary_uses_the_recent_ring_and_p95() {
         let root = tempfile::tempdir().unwrap();
         for ms in [10, 20, 30, 40, 50] {
-            record_query(root.path(), ms, ms == 50).unwrap();
+            record_query(root.path(), ms, ms == 50, "brain/ask").unwrap();
         }
         let summary = query_summary(root.path());
         assert_eq!(summary.query_count, 5);
         assert_eq!(summary.p95_ms, 50);
         assert_eq!(summary.timeout_count, 1);
+        assert_eq!(summary.callers[0].caller, "brain/ask");
+        assert_eq!(summary.callers[0].query_count, 5);
     }
 
     #[test]
     fn query_samples_are_bounded() {
         let root = tempfile::tempdir().unwrap();
         for ms in 0..(QUERY_RING_CAPACITY + 3) as u64 {
-            record_query(root.path(), ms, false).unwrap();
+            record_query(root.path(), ms, false, "manual").unwrap();
         }
         let summary = query_summary(root.path());
         assert_eq!(summary.query_count, QUERY_RING_CAPACITY);
         assert_eq!(summary.p95_ms, QUERY_RING_CAPACITY as u64 - 10);
+    }
+
+    #[test]
+    fn caller_labels_are_bounded_and_grouped() {
+        let root = tempfile::tempdir().unwrap();
+        record_query(root.path(), 12, false, "brain/ask?query=secret").unwrap();
+        record_query(root.path(), 20, true, "kanban/search").unwrap();
+        let summary = query_summary(root.path());
+        assert_eq!(summary.callers.len(), 2);
+        assert_eq!(summary.callers[0].caller, "brain/askquerysecret");
+        assert_eq!(summary.callers[1].caller, "kanban/search");
+        assert_eq!(normalize_caller(Some(&"x".repeat(100))), "x".repeat(64));
     }
 }
