@@ -32,12 +32,23 @@ fn query_and_drain_metrics_are_visible_in_status() {
         "--max-files",
         "10",
     ]);
-    run(&["query", "metrics-probe", "--home", &home_arg, "--k", "1"]);
+    run(&[
+        "query",
+        "metrics-probe",
+        "--home",
+        &home_arg,
+        "--k",
+        "1",
+        "--caller",
+        "brain/ask",
+    ]);
 
     let status = run(&["status", "--home", &home_arg]);
     assert_eq!(status["query_count"], 1);
     assert!(status["p95_ms"].is_number());
     assert_eq!(status["timeout_count"], 0);
+    assert_eq!(status["callers"][0]["caller"], "brain/ask");
+    assert_eq!(status["callers"][0]["query_count"], 1);
     assert_eq!(status["last_drain"]["files"], 0);
     assert_eq!(status["last_drain"]["records"], 0);
     assert_eq!(status["last_drain"]["tombstones"], 0);

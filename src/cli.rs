@@ -103,7 +103,7 @@ Currently an alias for `status`. Same flags.
     VerbSpec {
         verb: "query",
         usage: "\
-lastseek query <text> [--home DIR] [--k N] [--schema S]... [--min-score F]
+lastseek query <text> [--home DIR] [--k N] [--schema S]... [--min-score F] [--caller C]
 
 Answers record keys and scores. The index retains no record text, so a
 response never carries a body: point-fetch the record from LastDB by key.
@@ -113,9 +113,10 @@ response never carries a body: point-fetch the record from LastDB by key.
                  or a registry name. A name that resolves to nothing is an
                  ERROR, not an empty result — those are different answers.
   --min-score F  drop hits below this score
+  --caller C     stable operator label for the process that issued the query
   --exact        REFUSED (exit 1): substring matching needs retained text.
 ",
-        value_flags: &["--table", "--k", "--schema", "--min-score"],
+        value_flags: &["--table", "--k", "--schema", "--min-score", "--caller"],
         // `--exact` stays a recognised flag so the refusal names the reason
         // instead of the generic unknown-flag message.
         bool_flags: &["--exact"],

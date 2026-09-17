@@ -21,7 +21,7 @@ lastseek — memory-mapped semantic vector search for LastDB
 
 usage:
   lastseek status [--home DIR]
-  lastseek query <text> [--home DIR] [--k N] [--schema S]... [--min-score F]
+  lastseek query <text> [--home DIR] [--k N] [--schema S]... [--min-score F] [--caller C]
                                       answers keys + scores; bodies stay in LastDB
   lastseek add [--home DIR]           read Records as JSONL on stdin, embed, append
   lastseek compact [--home DIR]       fold the pending log into the slab
@@ -578,6 +578,7 @@ fn run() -> Result<(), LastSeekError> {
                         "query_count": query_metrics.query_count,
                         "p95_ms": query_metrics.p95_ms,
                         "timeout_count": query_metrics.timeout_count,
+                        "callers": query_metrics.callers,
                         "last_drain": serde_json::to_value(metrics::last_drain(&dir))?,
                         "applied_through": mark.applied_through,
                         "files_applied": mark.files_applied,
@@ -664,7 +665,11 @@ fn run() -> Result<(), LastSeekError> {
             let searcher = Searcher::new(&store, emb.id())?.with_schema_table(table.clone());
             let hits = searcher.search(&q, &opts)?;
             let elapsed_ms = started.elapsed().as_millis() as u64;
-            metrics::record_query(&dir, elapsed_ms, elapsed_ms >= QUERY_TIMEOUT_MS)?;
+            let caller = flag_value(&args, "--caller")
+                .or_else(|| std::env::var("LASTSEEK_CALLER").ok())
+                .map(|value| metrics::normalize_caller(Some(&value)))
+                .unwrap_or_else(|| metrics::normalize_caller(None));
+            metrics::record_query(&dir, elapsed_ms, elapsed_ms >= QUERY_TIMEOUT_MS, &caller)?;
             let rows: Vec<_> = hits
                 .iter()
                 .map(|h| {
