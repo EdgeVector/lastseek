@@ -2,3 +2,5 @@ target/
 *.lastseek-tmp
 # Marker written by `./bin/wt start` into each worktree, not product source.
 .portal-worktree
+# Release staging written by .lastgit/artifact-release.sh.
+dist/
