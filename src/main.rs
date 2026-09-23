@@ -20,6 +20,7 @@ const USAGE: &str = "\
 lastseek — memory-mapped semantic vector search for LastDB
 
 usage:
+  lastseek --version | -V             print `lastseek <version>`
   lastseek status [--home DIR]
   lastseek query <text> [--home DIR] [--k N] [--schema S]... [--min-score F] [--caller C]
                                       answers keys + scores; bodies stay in LastDB
@@ -65,9 +66,10 @@ answers and callers depend on telling them apart.
 A store names its own embedder, so LASTSEEK_EMBEDDER is an OVERRIDE, not a
 requirement: querying a store built with bge-small-en-v1.5 loads that model
 without being told. Only a fresh, unbound store needs telling. `bge` loads
-bge-small-en-v1.5 from $LASTSEEK_MODEL_DIR or
-~/.lastseek/models/bge-small-en-v1.5 and requires a build with
-`--features neural`; `deterministic` is a TEST FIXTURE with no semantics and is
+bge-small-en-v1.5 from $LASTSEEK_MODEL_DIR, else
+~/.lastseek/models/bge-small-en-v1.5, else the install's
+share/lastseek/models/bge-small-en-v1.5 (the Homebrew formula puts it there),
+and requires a build with `--features neural`; `deterministic` is a TEST FIXTURE with no semantics and is
 refused for production stores.
 ";
 
@@ -343,6 +345,14 @@ fn run() -> Result<(), LastSeekError> {
         print!("{USAGE}");
         return Ok(());
     };
+
+    // `lastseek --version` prints `lastseek <semver>`. Release tooling and the
+    // Homebrew formula test read the LAST whitespace token as the version, so
+    // keep this exact two-token shape.
+    if cmd == "--version" || cmd == "-V" {
+        println!("lastseek {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
 
     // Check the whole argument vector BEFORE resolving anything or touching a
     // store. `--help` on a verb prints that verb's usage and executes nothing,

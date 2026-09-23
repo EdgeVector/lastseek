@@ -32,10 +32,19 @@ jq -e '
     | select(
         .app == "lastseek"
         and .context == "artifact-release"
-        and .paths == ["dist/lastseek"]
+        and .paths == ["dist/lastseek", "LICENSE", "THIRD_PARTY_NOTICES"]
       )]
   | length == 1
 ' .lastgit/artifacts.json >/dev/null
+
+# Public Homebrew binaries are Apache-2.0 (decision 2026-09-23). The license
+# files the release artifact carries must exist and agree with Cargo.toml.
+grep -qx 'license = "Apache-2.0"' Cargo.toml
+grep -q 'Apache License' LICENSE
+grep -q 'Version 2.0, January 2004' LICENSE
+grep -q 'ONNX Runtime' THIRD_PARTY_NOTICES
+grep -q 'fastembed' THIRD_PARTY_NOTICES
+grep -q 'Install with Homebrew' README.md
 if grep -qE '^[[:space:]]*(bash[[:space:]]+)?\.lastgit/artifact-release\.sh([[:space:]]|$)' .lastgit/ci.sh; then
   echo "ci-required must not invoke the artifact-release context" >&2
   exit 1

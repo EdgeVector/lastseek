@@ -84,6 +84,64 @@ impl Embedder for DeterministicEmbedder {
     }
 }
 
+/// Directory name of the bge-small-en-v1.5 file set, both under
+/// `~/.lastseek/models/` and under the install's `share/lastseek/models/`.
+pub const BGE_MODEL_DIR_NAME: &str = "bge-small-en-v1.5";
+
+/// Resolve the bge-small-en-v1.5 model directory. Inputs are injected so the
+/// order is testable without touching the real environment.
+///
+/// 1. `LASTSEEK_MODEL_DIR`, when set, wins outright.
+/// 2. `$HOME/.lastseek/models/bge-small-en-v1.5`, when it holds `model.onnx`.
+/// 3. `<canonical exe dir>/../share/lastseek/models/bge-small-en-v1.5`, when it
+///    holds `model.onnx`. This is the Homebrew layout: the formula installs the
+///    binary at `Cellar/lastseek/<v>/bin/lastseek` and the model under its
+///    pkgshare, `Cellar/lastseek/<v>/share/lastseek/models/...`. The exe path
+///    is canonicalized first because `/opt/homebrew/bin/lastseek` is a
+///    symlink into the Cellar.
+/// 4. Otherwise the `$HOME` path from step 2, so the load error names the
+///    documented default location.
+///
+/// Not gated on the `neural` feature: the resolution is pure path logic and
+/// the required CI gate (which never builds `neural`) must test it.
+pub fn resolve_model_dir(
+    env_model_dir: Option<std::ffi::OsString>,
+    home: Option<std::ffi::OsString>,
+    current_exe: Option<std::path::PathBuf>,
+) -> std::path::PathBuf {
+    if let Some(v) = env_model_dir.filter(|v| !v.is_empty()) {
+        return v.into();
+    }
+    let base = home.unwrap_or_else(|| ".".into());
+    let home_dir = std::path::Path::new(&base)
+        .join(".lastseek")
+        .join("models")
+        .join(BGE_MODEL_DIR_NAME);
+    if home_dir.join("model.onnx").is_file() {
+        return home_dir;
+    }
+    if let Some(dir) = current_exe.and_then(|exe| install_share_model_dir(&exe)) {
+        if dir.join("model.onnx").is_file() {
+            return dir;
+        }
+    }
+    home_dir
+}
+
+/// `<canonical exe dir>/../share/lastseek/models/bge-small-en-v1.5`, or `None`
+/// when the exe path cannot be canonicalized or has no grandparent.
+fn install_share_model_dir(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let exe = std::fs::canonicalize(exe).ok()?;
+    let prefix = exe.parent()?.parent()?;
+    Some(
+        prefix
+            .join("share")
+            .join("lastseek")
+            .join("models")
+            .join(BGE_MODEL_DIR_NAME),
+    )
+}
+
 /// `bge-small-en-v1.5` via the vendored FastEmbed crate (CLS pooling,
 /// asymmetric query/document encoding).
 ///
@@ -108,17 +166,15 @@ impl BgeSmallEmbedder {
     const QUERY_INSTRUCTION: &'static str =
         "Represent this sentence for searching relevant passages: ";
 
-    /// `~/.lastseek/models/bge-small-en-v1.5`, overridable via
-    /// `LASTSEEK_MODEL_DIR`. Never read out of another app's `node_modules`.
+    /// Where the bge-small-en-v1.5 files are read from. See
+    /// [`resolve_model_dir`] for the order. Never read out of another app's
+    /// `node_modules`.
     pub fn default_model_dir() -> std::path::PathBuf {
-        if let Ok(v) = std::env::var("LASTSEEK_MODEL_DIR") {
-            return v.into();
-        }
-        let base = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-        std::path::Path::new(&base)
-            .join(".lastseek")
-            .join("models")
-            .join("bge-small-en-v1.5")
+        resolve_model_dir(
+            std::env::var_os("LASTSEEK_MODEL_DIR"),
+            std::env::var_os("HOME"),
+            std::env::current_exe().ok(),
+        )
     }
 
     /// Loads `model.onnx` and the tokenizer file set from `model_dir`. See
@@ -201,5 +257,103 @@ impl Embedder for BgeSmallEmbedder {
             .map(|t| format!("{}{t}", Self::QUERY_INSTRUCTION))
             .collect();
         self.embed_raw(&prefixed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::{Path, PathBuf};
+
+    fn touch_model(dir: &Path) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("model.onnx"), b"stub").unwrap();
+    }
+
+    /// A Homebrew-shaped tree: `Cellar/lastseek/0.1.1/bin/lastseek` plus a
+    /// `bin/lastseek` symlink into it, like `/opt/homebrew/bin/lastseek`.
+    /// Returns (symlinked exe, pkgshare model dir).
+    fn brew_layout(root: &Path) -> (PathBuf, PathBuf) {
+        let keg = root.join("Cellar").join("lastseek").join("0.1.1");
+        std::fs::create_dir_all(keg.join("bin")).unwrap();
+        let real_exe = keg.join("bin").join("lastseek");
+        std::fs::write(&real_exe, b"").unwrap();
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let link = root.join("bin").join("lastseek");
+        std::os::unix::fs::symlink(&real_exe, &link).unwrap();
+        let share = keg
+            .join("share")
+            .join("lastseek")
+            .join("models")
+            .join(BGE_MODEL_DIR_NAME);
+        (link, share)
+    }
+
+    #[test]
+    fn env_override_wins_over_everything() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        touch_model(&home.join(".lastseek/models").join(BGE_MODEL_DIR_NAME));
+        let (exe, share) = brew_layout(&t.path().join("brew"));
+        touch_model(&share);
+        let got = resolve_model_dir(
+            Some("/custom/model".into()),
+            Some(home.into_os_string()),
+            Some(exe),
+        );
+        assert_eq!(got, PathBuf::from("/custom/model"));
+    }
+
+    #[test]
+    fn empty_env_override_is_ignored() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let got = resolve_model_dir(Some("".into()), Some(home.clone().into_os_string()), None);
+        assert_eq!(got, home.join(".lastseek/models").join(BGE_MODEL_DIR_NAME));
+    }
+
+    #[test]
+    fn home_model_wins_over_install_share() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let home_dir = home.join(".lastseek/models").join(BGE_MODEL_DIR_NAME);
+        touch_model(&home_dir);
+        let (exe, share) = brew_layout(&t.path().join("brew"));
+        touch_model(&share);
+        let got = resolve_model_dir(None, Some(home.into_os_string()), Some(exe));
+        assert_eq!(got, home_dir);
+    }
+
+    #[test]
+    fn falls_back_to_homebrew_pkgshare_through_the_bin_symlink() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        // A HOME dir that exists but lacks model.onnx must not stop the fallback.
+        std::fs::create_dir_all(home.join(".lastseek/models").join(BGE_MODEL_DIR_NAME)).unwrap();
+        let (exe, share) = brew_layout(&t.path().join("brew"));
+        touch_model(&share);
+        let got = resolve_model_dir(None, Some(home.into_os_string()), Some(exe));
+        assert_eq!(got, std::fs::canonicalize(&share).unwrap());
+    }
+
+    #[test]
+    fn no_model_anywhere_names_the_home_default() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let (exe, _share) = brew_layout(&t.path().join("brew"));
+        let got = resolve_model_dir(None, Some(home.clone().into_os_string()), Some(exe));
+        assert_eq!(got, home.join(".lastseek/models").join(BGE_MODEL_DIR_NAME));
+    }
+
+    #[test]
+    fn missing_exe_path_names_the_home_default() {
+        let t = tempfile::tempdir().unwrap();
+        let home = t.path().join("home");
+        let got = resolve_model_dir(
+            None,
+            Some(home.clone().into_os_string()),
+            Some(t.path().join("does-not-exist")),
+        );
+        assert_eq!(got, home.join(".lastseek/models").join(BGE_MODEL_DIR_NAME));
     }
 }

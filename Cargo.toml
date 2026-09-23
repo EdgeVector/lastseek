@@ -1,9 +1,9 @@
 [package]
 name = "lastseek"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "LastSeek — memory-mapped semantic vector search for LastDB, outside Mini"
-license = "MIT"
+license = "Apache-2.0"
 
 # Without this, Cargo's implicit workspace would pull the vendored fastembed
 # fork in as a member, so `cargo fmt --all` / `cargo clippy --all-targets

@@ -48,4 +48,26 @@ test -x dist/lastseek
 dist/lastseek --help >/dev/null
 dist/lastseek --help | grep -q 'bge-small-en-v1.5'
 
+# The release tarball and the Homebrew formula read the version from
+# `--version`: the LAST whitespace token must be the Cargo semver.
+cargo_version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n 1)"
+shipped_version="$(dist/lastseek --version | awk '{print $NF}')"
+if [ "$shipped_version" != "$cargo_version" ]; then
+  echo "dist/lastseek --version says '$shipped_version', Cargo.toml says '$cargo_version'" >&2
+  exit 1
+fi
+
+# The public binary is Apache-2.0 and statically links third-party code, so
+# the license and the third-party notices travel with it. artifacts.json
+# publishes them from the tree root, next to dist/ (not inside it), so the
+# dist/lastseek path that Host Track links stays unchanged.
+for f in LICENSE THIRD_PARTY_NOTICES; do
+  test -s "$f" || {
+    echo "release artifact file $f is missing or empty" >&2
+    exit 1
+  }
+done
+grep -q 'Apache License' LICENSE
+grep -q 'ONNX Runtime' THIRD_PARTY_NOTICES
+
 echo "lastseek artifact release PASSED"

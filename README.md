@@ -262,6 +262,28 @@ BGE is **asymmetric**: `lastseek query` prepends the model's query
 instruction, `lastseek add` does not. Embedding the same text through both
 paths produces different vectors on purpose.
 
+### Install with Homebrew
+
+On Apple Silicon Macs:
+
+```bash
+brew install edgevector/lastdb/lastseek
+lastseek --version
+```
+
+The formula installs the binary and the bge-small-en-v1.5 model files. The
+model goes under the formula's pkgshare,
+`$(brew --prefix)/opt/lastseek/share/lastseek/models/bge-small-en-v1.5`, so no
+separate download is needed. `lastseek` looks for the model in this order:
+
+1. `$LASTSEEK_MODEL_DIR`, when set (an explicit override).
+2. `~/.lastseek/models/bge-small-en-v1.5`, when it holds `model.onnx`.
+3. `share/lastseek/models/bge-small-en-v1.5` next to the installed binary
+   (the Homebrew location).
+
+The public binaries are licensed under Apache-2.0 (see `LICENSE`). Bundled
+third-party code is listed in `THIRD_PARTY_NOTICES`. The source stays private.
+
 ### Fetching the bge-small-en-v1.5 weights
 
 Neither the weights nor a fetch step ship in this repo — `neural`-feature
@@ -316,8 +338,8 @@ cargo test --release --features neural,fault-injection
 ### Artifact release context
 
 The installable binary is produced by the separate LastGit
-`artifact-release` context. It builds with `--features neural`, stages only
-`dist/lastseek`, and publishes an immutable artifact whose manifest records the
+`artifact-release` context. It builds with `--features neural`, stages
+`dist/lastseek` plus `LICENSE` and `THIRD_PARTY_NOTICES` from the tree root, and publishes an immutable artifact whose manifest records the
 exact source commit. The required `ci-required` merge gate never invokes this
 slow build.
 
