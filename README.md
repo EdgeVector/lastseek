@@ -355,3 +355,5 @@ lastgit ci watch --repo lastseek \
   --timeout-ms 900000 \
   --once
 ```
+
+<!-- lastgit-era-3 proof commit 2026-09-26 -->
