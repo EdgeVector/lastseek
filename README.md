@@ -1,7 +1,7 @@
 # LastSeek
 
 Memory-mapped semantic vector search for LastDB. Canonical remote
-`http://localhost:3300/EdgeVector/lastseek.git` (LastGit).
+`https://github.com/EdgeVector/lastseek` (GitHub, private).
 
 LastSeek runs **outside Mini**, so a default `lastdbd` ships no model weights
 and no inference runtime. The index is **local-only and regenerable** from
@@ -335,25 +335,14 @@ machine that has the weights:
 cargo test --release --features neural,fault-injection
 ```
 
-### Artifact release context
+### Artifact release
 
-The installable binary is produced by the separate LastGit
-`artifact-release` context. It builds with `--features neural`, stages
-`dist/lastseek` plus `LICENSE` and `THIRD_PARTY_NOTICES` from the tree root, and publishes an immutable artifact whose manifest records the
-exact source commit. The required `ci-required` merge gate never invokes this
-slow build.
-
-On the forge host, run the context against a cursor seeded immediately before
-the target `main` update so the watcher builds that exact new tip without
-replaying historical commits:
-
-```bash
-lastgit ci watch --repo lastseek \
-  --context artifact-release \
-  --ref refs/heads/main \
-  --state-file /path/to/pre-update.cursor \
-  --timeout-ms 900000 \
-  --once
-```
-
-<!-- lastgit-era-3 proof commit 2026-09-26 -->
+The installable binary is produced by the `publish` job of
+`.github/workflows/ci-required.yml` on every push to `main`, after
+`ci-required` is green. The job runs `.lastgit/artifact-release.sh` on a macOS
+runner (`cargo build --locked --release --features neural`), then packs
+`dist/lastseek`, `LICENSE` and `THIRD_PARTY_NOTICES` into the Actions artifact
+`ht-artifact-<commit sha>`. `host-track refresh lastseek` pulls and verifies it
+on the Mac. The build fetches the ONNX Runtime binaries but never model
+weights: the weights are host state. The required `ci-required` gate never
+invokes the slow build.

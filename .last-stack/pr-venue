@@ -1,4 +1,3 @@
-lastgit
-# Gate of record for EdgeVector/lastseek: LastGit (lastdb:///lastseek), Tom 2026-09-26.
-# Migrated back onto LastGit under the era-3 reverse migration. Workflow: standard lastgit cr create/approve/merge.
-# Decision: decision-2026-09-26-lift-forgejo-venue-block-for-lastgit-era-3. North Star: north-star-lastgit-era-3-primary-migration.
+github
+# Gate of record for EdgeVector/lastseek: GitHub (github.com/EdgeVector/lastseek), 2026-09-30.
+# Decision: decision-2026-09-29-retire-lastgit-all-repos-to-github. Workflow: PR with the ci-required check.
