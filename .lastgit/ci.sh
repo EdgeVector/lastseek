@@ -24,14 +24,17 @@ test ! -d vendor/laststore
 bash -n .lastgit/ci.sh
 bash -n .lastgit/artifact-release.sh
 
-# The feature-complete binary is built only by the dedicated release context.
-# Keep this gate cheap while proving the publication route cannot silently
-# fall back to ci-required.
+# The feature-complete binary is built only by the separate `publish` job of
+# ci-required.yml (macOS runner, last-stack reusable workflow), which packs
+# these paths. The builder skips an entry whose context is not ci-required, so
+# the entry must carry no context. Keep this gate cheap while proving the
+# publication route cannot silently fall back to the slow build.
 jq -e '
   [.artifacts[]
     | select(
         .app == "lastseek"
-        and .context == "artifact-release"
+        and .platform == "darwin-arm64"
+        and (has("context") | not)
         and .paths == ["dist/lastseek", "LICENSE", "THIRD_PARTY_NOTICES"]
       )]
   | length == 1

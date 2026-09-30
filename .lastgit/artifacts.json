@@ -2,7 +2,6 @@
   "artifacts": [
     {
       "app": "lastseek",
-      "context": "artifact-release",
       "paths": [
         "dist/lastseek",
         "LICENSE",
