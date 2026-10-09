@@ -40,8 +40,8 @@ ort-sys = { version = "=2.0.0-rc.9", optional = true, default-features = false }
 tempfile = "3"
 
 [features]
-# Table-driven crash simulation for compact() (tests/store.rs). Never linked
-# into a default build.
+# Table-driven crash simulation for compact(). Never linked into a default
+# build.
 fault-injection = []
 neural = ["dep:fastembed", "dep:ort-sys"]
 
