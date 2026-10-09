@@ -48,9 +48,7 @@ Every directory the store creates is `0700` and every file `0600`, set at
 creation time in the writer. A `chmod` on a live path would not do: compaction
 replaces the generation directory on most drain ticks, and the next one would
 inherit the process umask again. The invariant is that no LastSeek artifact is
-more readable than the LastDB store it projects. `tests/no_bodies.rs` drives
-the real binary under `umask 000` across two compactions and asserts both
-halves — no body on disk or in a response, nothing group/world-readable.
+more readable than the LastDB store it projects.
 
 A store written before this rule carries bodies in its current generation. The
 first `compact` the fixed binary runs rewrites that generation without them,
@@ -246,8 +244,8 @@ internal consistency alone.
 
 ## Embedders
 
-`LASTSEEK_EMBEDDER=deterministic` selects a test fixture with no semantics, so
-CI can prove storage, scope and ranking offline without downloading weights.
+`LASTSEEK_EMBEDDER=deterministic` selects a fixture with no semantics that
+needs no downloaded weights.
 `LASTSEEK_EMBEDDER=bge` selects real neural embedding — `bge-small-en-v1.5`
 via the vendored FastEmbed crate (`vendor/fastembed-4.9.0-no-image`, the same
 fork `fold` uses) — and requires a build with `--features neural`.
@@ -286,8 +284,7 @@ third-party code is listed in `THIRD_PARTY_NOTICES`. The source stays private.
 
 ### Fetching the bge-small-en-v1.5 weights
 
-Neither the weights nor a fetch step ship in this repo — `neural`-feature
-tests skip themselves when the model files are absent, and CI never fetches
+Neither the weights nor a fetch step ship in this repo, and CI never fetches
 them. To use `LASTSEEK_EMBEDDER=bge` locally, download the five files FastEmbed
 itself would pull from `Xenova/bge-small-en-v1.5` into
 `~/.lastseek/models/bge-small-en-v1.5` (or `$LASTSEEK_MODEL_DIR`):
@@ -321,19 +318,16 @@ transformers.js startup, and `ort` does not have it.
 ## Development
 
 ```bash
-cargo test
 bash .lastgit/ci.sh
 ```
+
+The tests are deleted (2026-10-09). The gate runs `cargo fmt`, `cargo clippy
+--all-targets`, and a build.
 
 The required gate builds an **explicit** feature set, not `--all-features`.
 `--all-features` turns on `neural`, which downloads ONNX Runtime at build time
 (contradicting the gate's own weightless contract) and takes ~11.5 minutes in
-release — past LastGit's 600 s CI timeout. Run the neural tests locally, on a
-machine that has the weights:
-
-```bash
-cargo test --release --features neural,fault-injection
-```
+release — past LastGit's 600 s CI timeout.
 
 ### Artifact release
 

@@ -35,7 +35,7 @@
 //! `meta.jsonl`, which put credential material that LastDB protects at `0600`
 //! into a `0644` file that any local process could read and any semantic
 //! query would echo (`papercut-lastseek-serves-credential-material-from-a-world-readable-plaintext-corpus`).
-//! Two rules now hold, and `tests/store.rs` proves both across compactions:
+//! Two rules now hold across compactions:
 //!
 //! - No artifact under the store root is group- or world-readable. Every
 //!   directory is created `0700` and every file `0600`, set **at creation
