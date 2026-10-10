@@ -1,4 +1,5 @@
 [package]
+autotests = false
 name = "fastembed"
 version = "4.9.0"
 edition = "2021"
@@ -54,3 +55,8 @@ optimum-cli = []
 
 # For compatibility recommend using hf-hub-native-tls
 online = ["hf-hub-native-tls"]
+
+[lib]
+test = false
+doctest = false
+bench = false
