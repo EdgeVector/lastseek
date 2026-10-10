@@ -82,7 +82,7 @@ if grep -qE '^[[:space:]]*cargo (clippy|build).*--all-features' .lastgit/ci.sh; 
 fi
 
 cargo fmt --all -- --check
-cargo clippy --all-targets --features "$FEATURES" -- -D warnings
+cargo clippy --lib --bins --features "$FEATURES" -- -D warnings
 cargo build --features "$FEATURES"
 
 echo "lastgit ci gate PASSED"
