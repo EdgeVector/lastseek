@@ -1,0 +1,21 @@
+name: Generated evidence
+on:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  generated-evidence:
+    name: generated-evidence
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: EdgeVector/.github/generated-evidence@2d3bbe6838e4274f24e3879535e99329578f7273
+        with:
+          base: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha || format('origin/{0}', github.event.repository.default_branch) }}
+          head: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha || github.sha }}
