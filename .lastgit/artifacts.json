@@ -4,6 +4,7 @@
       "app": "lastseek",
       "paths": [
         "dist/lastseek",
+        "lastseek.app.json",
         "LICENSE",
         "THIRD_PARTY_NOTICES"
       ],
