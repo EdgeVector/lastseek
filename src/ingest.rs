@@ -419,6 +419,7 @@ pub fn pending_batches(
     after: &str,
     max: usize,
 ) -> Result<(Vec<PathBuf>, usize), LastSeekError> {
+    crate::search_queue::ensure_current(inbox)?;
     if !inbox.is_dir() {
         return Ok((Vec::new(), 0));
     }

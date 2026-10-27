@@ -367,6 +367,7 @@ fn run() -> Result<(), LastSeekError> {
     }
 
     let dir = home(&args);
+    lastseek::search_queue::check_command(&args, &cmd)?;
 
     match cmd.as_str() {
         "schema-table" => {
@@ -579,7 +580,7 @@ fn run() -> Result<(), LastSeekError> {
                     };
                     let out = serde_json::json!({
                         "ok": true,
-                        "state": state,
+                        "state": lastseek::search_queue::reported_state(state, &args)?,
                         "home": dir.to_string_lossy(),
                         // Absent, never zero, when nothing has been applied or
                         // the watermark carries no time prefix — "fresh" and
@@ -599,7 +600,7 @@ fn run() -> Result<(), LastSeekError> {
                                 "reason": "not requested — the queue reads the inbox directory, which has held 127k entries on this host; pass --queue",
                             }),
                         },
-                        "needs_rebuild": false,
+                        "needs_rebuild": lastseek::search_queue::required(&lastseek::search_queue::inbox(&args))?,
                         "embedder_id": store.embedder_id(),
                         "dimensions": store.dimensions(),
                         "committed_rows": store.committed_rows(),
@@ -701,6 +702,7 @@ fn run() -> Result<(), LastSeekError> {
                     })
                 })
                 .collect();
+            lastseek::search_queue::check_command(&args, &cmd)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -762,6 +764,7 @@ fn run() -> Result<(), LastSeekError> {
             let mut unreadable: Vec<String> = Vec::new();
 
             for path in &files {
+                lastseek::search_queue::ensure_current(&inbox)?;
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
