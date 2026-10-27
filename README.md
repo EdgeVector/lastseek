@@ -4,6 +4,8 @@ LastDB Search delivery is off by default. Start LastDB with `lastdbd --enable-se
 The live producer stops delivery at its queue limit and records `apps/search/inbox/.rebuild-required`.
 Database writes continue. LastSeek reports `needs_rebuild` and refuses queries and drains for that inbox until recovery completes.
 The marker can also indicate database writes while Search delivery was disabled.
+Each drain saves its absolute source inbox in the store. Queries and status use that same source by default.
+Use `--inbox DIR` on a query or drain to select a source explicitly. An unreadable saved source returns an error.
 
 After a feed gap, stop database writes and rebuild a fresh LastSeek store from all current LastDB records.
 Do not clear the marker or resume old queued batches into that rebuilt store before a complete rebuild succeeds.

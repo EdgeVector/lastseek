@@ -105,6 +105,8 @@ Currently an alias for `status`. Same flags.
         usage: "\
 lastseek query <text> [--home DIR] [--k N] [--schema S]... [--min-score F] [--caller C]
 
+Use --inbox DIR to select the same LastDB feed as drain. Otherwise the store uses its saved source inbox.
+
 Answers record keys and scores. The index retains no record text, so a
 response never carries a body: point-fetch the record from LastDB by key.
 
@@ -116,7 +118,7 @@ response never carries a body: point-fetch the record from LastDB by key.
   --caller C     stable operator label for the process that issued the query
   --exact        REFUSED (exit 1): substring matching needs retained text.
 ",
-        value_flags: &["--table", "--k", "--schema", "--min-score", "--caller"],
+        value_flags: &["--table", "--k", "--schema", "--min-score", "--caller", "--inbox"],
         // `--exact` stays a recognised flag so the refusal names the reason
         // instead of the generic unknown-flag message.
         bool_flags: &["--exact"],
