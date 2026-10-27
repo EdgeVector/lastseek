@@ -367,6 +367,7 @@ fn run() -> Result<(), LastSeekError> {
     }
 
     let dir = home(&args);
+    lastseek::search_queue::check_command(&args, &cmd, &dir)?;
 
     match cmd.as_str() {
         "schema-table" => {
@@ -567,9 +568,7 @@ fn run() -> Result<(), LastSeekError> {
                     let lag = lastseek::ingest::freshness_lag_ms(&mark.applied_through);
                     let query_metrics = metrics::query_summary(&dir);
                     let queue = if args.iter().any(|a| a == "--queue") {
-                        let inbox = flag_value(&args, "--inbox")
-                            .map(std::path::PathBuf::from)
-                            .unwrap_or_else(lastseek::ingest::default_inbox);
+                        let inbox = lastseek::search_queue::inbox(&args, &dir)?;
                         Some(lastseek::ingest::queue_stats(
                             &inbox,
                             &mark.applied_through,
@@ -579,7 +578,7 @@ fn run() -> Result<(), LastSeekError> {
                     };
                     let out = serde_json::json!({
                         "ok": true,
-                        "state": state,
+                        "state": lastseek::search_queue::reported_state(state, &args, &dir)?,
                         "home": dir.to_string_lossy(),
                         // Absent, never zero, when nothing has been applied or
                         // the watermark carries no time prefix — "fresh" and
@@ -599,7 +598,7 @@ fn run() -> Result<(), LastSeekError> {
                                 "reason": "not requested — the queue reads the inbox directory, which has held 127k entries on this host; pass --queue",
                             }),
                         },
-                        "needs_rebuild": false,
+                        "needs_rebuild": lastseek::search_queue::required(&lastseek::search_queue::inbox(&args, &dir)?)?,
                         "embedder_id": store.embedder_id(),
                         "dimensions": store.dimensions(),
                         "committed_rows": store.committed_rows(),
@@ -701,6 +700,7 @@ fn run() -> Result<(), LastSeekError> {
                     })
                 })
                 .collect();
+            lastseek::search_queue::check_command(&args, &cmd, &dir)?;
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -740,9 +740,7 @@ fn run() -> Result<(), LastSeekError> {
             );
         }
         "drain" => {
-            let inbox = flag_value(&args, "--inbox")
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(lastseek::ingest::default_inbox);
+            let inbox = lastseek::search_queue::inbox(&args, &dir)?;
             let max = parse_flag::<usize>(&args, "--max-files")?
                 .unwrap_or(lastseek::ingest::DEFAULT_MAX_FILES);
             let consume = args.iter().any(|a| a == "--consume");
@@ -762,6 +760,7 @@ fn run() -> Result<(), LastSeekError> {
             let mut unreadable: Vec<String> = Vec::new();
 
             for path in &files {
+                lastseek::search_queue::ensure_current(&inbox)?;
                 let name = path
                     .file_name()
                     .map(|n| n.to_string_lossy().to_string())
@@ -828,6 +827,7 @@ fn run() -> Result<(), LastSeekError> {
                     let _ = std::fs::remove_file(path);
                 }
             }
+            lastseek::search_queue::ensure_current(&inbox)?;
             mark.save(&dir)?;
             metrics::save_last_drain(
                 &dir,

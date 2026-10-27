@@ -14,6 +14,7 @@ pub mod index;
 pub mod ingest;
 pub mod metrics;
 pub mod schema;
+pub mod search_queue;
 pub mod source_counts;
 pub mod store;
 
@@ -21,6 +22,8 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum LastSeekError {
+    #[error("Search rebuild required: LastDB stopped the change feed after Search was disabled or its queue reached the limit. Rebuild a fresh LastSeek store from all current LastDB records before the owner clears .rebuild-required; database writes continue.")]
+    SearchRebuildRequired,
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
