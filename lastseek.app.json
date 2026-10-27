@@ -1,0 +1,7 @@
+{
+  "app_id": "lastseek",
+  "display_name": "lastseek",
+  "description": "Memory-mapped semantic vector search for LastDB — disposable projection with O(changed) flush cost and OS page cache residency.",
+  "homepage_url": "https://github.com/EdgeVector/lastseek",
+  "lastdb": ">=0.23.0, <0.25.0"
+}

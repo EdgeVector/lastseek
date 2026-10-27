@@ -35,7 +35,7 @@ jq -e '
         .app == "lastseek"
         and .platform == "darwin-arm64"
         and (has("context") | not)
-        and .paths == ["dist/lastseek", "LICENSE", "THIRD_PARTY_NOTICES"]
+        and .paths == ["dist/lastseek", "lastseek.app.json", "LICENSE", "THIRD_PARTY_NOTICES"]
       )]
   | length == 1
 ' .lastgit/artifacts.json >/dev/null
