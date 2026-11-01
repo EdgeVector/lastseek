@@ -155,6 +155,13 @@ ratio was `live / (live + history)`, which cannot reach the floor and falls as
 the corpus ages. It is still reported, as `partition_rows`, because it is
 informative — just not a denominator.
 
+A format 7 LastDB home can send `record_count: null`: an unfiltered count fails
+above 10,000 records, and a failed count is unknown. Coverage then reports that
+schema with `partition_rows: null` and `partition_rows_note: "unknown"`, and
+`uncounted_schemas` gives the number of such schemas. LastSeek does not page the
+schema to count it, and the rating does not change, because it never divides by
+this count.
+
 The rule: **a coverage metric must divide by a count the owning app would
 recognise as its own.** The app is the only thing that knows, because it
 dual-writes the keyed secondary that makes its corpus enumerable without a scan.

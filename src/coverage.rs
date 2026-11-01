@@ -27,6 +27,16 @@
 //!
 //! The catalog count is still carried, as `partition_rows`, because it is
 //! genuinely useful — it is just not a denominator.
+//!
+//! # A catalog count can be unknown
+//!
+//! A format 7 LastDB home sends `record_count: null` when it did not count a
+//! schema: an unfiltered count fails above 10,000 records, and any count
+//! failure is unknown, never zero. LastSeek reports such a schema with
+//! `partition_rows: null` and `partition_rows_note: "unknown"`. It does not
+//! page the schema to count it: that is one cursor walk per schema on every
+//! `--coverage` call. Coverage does not divide by this count, so the rating
+//! does not change.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -63,16 +73,25 @@ struct CatalogEntry {
     #[serde(default)]
     descriptive_name: Option<String>,
     name: String,
+    /// `None` for a missing key or a JSON `null`: the node did not count the
+    /// schema (see the module doc). Unknown, never zero.
     #[serde(default)]
-    record_count: u64,
+    record_count: Option<u64>,
 }
 
 #[derive(Debug, Default)]
 struct JoinedSchema {
     label: Option<String>,
     registry_names: BTreeSet<String>,
+    /// The largest known catalog count over the aliases of this identity.
     source_records: u64,
+    /// True when any alias reported no count. The joined count is then
+    /// unknown: a known alias count is not a count of the others.
+    source_records_unknown: bool,
 }
+
+/// `partition_rows_note` for a schema whose catalog count is unknown.
+pub const PARTITION_ROWS_UNKNOWN: &str = "unknown";
 
 #[derive(Debug, Clone, Serialize, PartialEq)]
 pub struct SchemaCoverage {
@@ -85,8 +104,13 @@ pub struct SchemaCoverage {
     pub live_records: Option<u64>,
     /// The node catalog's `record_count`: rows in the partition, including
     /// superseded versions. Carried because it is informative, and named so it
-    /// cannot be mistaken for the denominator again.
+    /// cannot be mistaken for the denominator again. `None` when the source
+    /// catalog does not know the identity, or did not count it.
     pub partition_rows: Option<u64>,
+    /// `"unknown"` when the source catalog lists the schema but sent a null
+    /// count. Absent when `partition_rows` holds a count.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub partition_rows_note: Option<&'static str>,
     /// Where the declared count came from, in the declaring app's own words.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub declared_by: Option<String>,
@@ -107,6 +131,8 @@ pub struct CoverageReport {
     pub untracked_schemas: usize,
     /// Identities holding vectors that the source catalog does not know.
     pub unknown_source_schemas: usize,
+    /// Listed schemas whose catalog count is unknown (`partition_rows_note`).
+    pub uncounted_schemas: usize,
     pub schemas: Vec<SchemaCoverage>,
 }
 
@@ -140,7 +166,10 @@ impl CoverageReport {
             // Several live catalog identities expose the same logical Card
             // rows. Collapsing aliases by canonical identity and taking max
             // prevents one corpus from multiplying the denominator.
-            row.source_records = row.source_records.max(entry.record_count);
+            match entry.record_count {
+                Some(count) => row.source_records = row.source_records.max(count),
+                None => row.source_records_unknown = true,
+            }
             if row.label.is_none() {
                 row.label = table
                     .label_for_identity(&identity)
@@ -153,7 +182,12 @@ impl CoverageReport {
         for (identity, row) in &joined {
             let vectors = vectors_by_identity.get(identity).copied().unwrap_or(0) as u64;
             let decl = declared.get(identity);
-            if row.source_records == 0 && vectors == 0 && decl.is_none() {
+            // An unknown count may hide records, so only a counted zero skips.
+            if !row.source_records_unknown
+                && row.source_records == 0
+                && vectors == 0
+                && decl.is_none()
+            {
                 continue;
             }
 
@@ -182,7 +216,8 @@ impl CoverageReport {
                 registry_names: row.registry_names.iter().cloned().collect(),
                 vectors_held: vectors,
                 live_records,
-                partition_rows: Some(row.source_records),
+                partition_rows: (!row.source_records_unknown).then_some(row.source_records),
+                partition_rows_note: row.source_records_unknown.then_some(PARTITION_ROWS_UNKNOWN),
                 declared_by: decl.map(|d| d.source.clone()).filter(|s| !s.is_empty()),
                 ratio,
                 state,
@@ -208,6 +243,7 @@ impl CoverageReport {
                 vectors_held: *vectors as u64,
                 live_records: None,
                 partition_rows: None,
+                partition_rows_note: None,
                 declared_by: None,
                 ratio: None,
                 state: STATE_UNKNOWN_SOURCE,
@@ -226,6 +262,10 @@ impl CoverageReport {
             degraded_schemas,
             untracked_schemas: count_of(STATE_NOT_TRACKED),
             unknown_source_schemas: count_of(STATE_UNKNOWN_SOURCE),
+            uncounted_schemas: schemas
+                .iter()
+                .filter(|s| s.partition_rows_note.is_some())
+                .count(),
             schemas,
         })
     }
