@@ -47,5 +47,6 @@
     ],
     "post_install": [],
     "requires": []
-  }
+  },
+  "audience": "private"
 }
