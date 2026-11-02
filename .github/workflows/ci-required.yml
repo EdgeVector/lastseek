@@ -49,10 +49,24 @@ jobs:
     if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
     permissions:
       contents: read
-    uses: EdgeVector/last-stack/.github/workflows/host-track-artifact.yml@main
+    uses: EdgeVector/last-stack/.github/workflows/registry-app-package.yml@main
     with:
       runs-on: macos-latest
       # cargo build --features neural (downloads ONNX Runtime binaries, never model
       # weights), then the release script's own smoke checks (--help, --version).
       build-command: "bash .lastgit/artifact-release.sh"
-      config: .lastgit/artifacts.json
+      config: .last-stack/package.json
+
+  registry-commit:
+    name: Registry commit identity
+    needs: [ci-required]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - run: python3 scripts/registry-commit.py

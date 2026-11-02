@@ -1,0 +1,51 @@
+{
+  "app_id": "lastseek",
+  "version": "0.1.1",
+  "source": "https://github.com/EdgeVector/lastseek.git",
+  "metadata": {
+    "display_name": "lastseek",
+    "description": "LastDB semantic search",
+    "homepage_url": "https://github.com/EdgeVector/lastseek"
+  },
+  "run": {
+    "runtime": "command",
+    "entrypoint": "dist/lastseek"
+  },
+  "schemas": [],
+  "outbox_format_version": 1,
+  "install": {
+    "prepare": [
+      {
+        "argv": [
+          "python3",
+          "scripts/registry-prepare.py"
+        ],
+        "timeout_s": 600
+      }
+    ],
+    "probe": [
+      {
+        "argv": [
+          "./dist/lastseek",
+          "--help"
+        ],
+        "timeout_s": 30
+      },
+      {
+        "argv": [
+          "bash",
+          "scripts/registry-models.sh"
+        ],
+        "timeout_s": 30
+      }
+    ],
+    "links": [
+      {
+        "source": "dist/lastseek",
+        "command": "lastseek"
+      }
+    ],
+    "post_install": [],
+    "requires": []
+  }
+}
