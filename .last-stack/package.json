@@ -1,0 +1,14 @@
+{
+  "artifacts": [
+    {
+      "app": "lastseek",
+      "paths": [
+        "dist/lastseek",
+        "lastseek.app.json",
+        "LICENSE",
+        "THIRD_PARTY_NOTICES"
+      ],
+      "platform": "darwin-arm64"
+    }
+  ]
+}
