@@ -14,6 +14,14 @@ feed gap, changed schema definitions, or a different LastDB boot requires
 another rebuild. LastSeek reports that condition in `status`.
 
 This workflow covers searchable Brain schemas and ordinary local writes.
+On a machine where the default index serves other apps too, run
+`lastseek rebuild --home ~/.lastseek/brain-index`. A query naming only
+Brain schemas uses this published index when it covers the entire query.
+Queries with an explicit store or inbox retain that selection. Schedule
+`lastseek drain --home ~/.lastseek/brain-index --max-files 500` alongside
+the default inbox worker. The online drain compacts when its pending log
+reaches the store threshold.
+
 Use `--home DIR --schema brain/Reference` for a separate scoped index.
 The rebuild refuses to replace an index that contains vectors outside its
 scope. Shared peer replay and concurrent schema maintenance are outside this

@@ -44,6 +44,12 @@ impl Checkpoint {
         &self.cursor
     }
 
+    pub fn covers(&self, schemas: &[String]) -> bool {
+        schemas
+            .iter()
+            .all(|schema| self.projections.contains_key(schema))
+    }
+
     pub fn include_scopes(&self, table: &mut SchemaTable) {
         for (name, projection) in &self.projections {
             table.include_scope(name, &projection.identity);
@@ -414,13 +420,17 @@ pub fn drain(
         checkpoint.cursor = page.next_cursor;
         checkpoint.save(dir)?;
     }
+    let compacted = store.pending_ops() >= COMPACT_AT;
+    if compacted {
+        store.compact()?;
+    }
     metrics::save_last_drain(
         dir,
         &LastDrain {
             files: 0,
             records: applied.records as u64,
             tombstones: applied.tombstones as u64,
-            compacted: false,
+            compacted,
         },
     )?;
     Ok(json!({
