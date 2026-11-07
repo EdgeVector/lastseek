@@ -57,6 +57,7 @@ pub(crate) struct Keys {
 #[derive(Deserialize)]
 pub(crate) struct Change {
     cursor: String,
+    mutation_id: String,
     pub schema_name: String,
     key: KeyValue,
 }
@@ -67,6 +68,26 @@ pub(crate) struct FeedPage {
     pub next_cursor: String,
     pub has_more: bool,
     gap: bool,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct FeedPosition {
+    pub cursor: String,
+    #[serde(default)]
+    pub anchor: Option<String>,
+}
+
+impl FeedPage {
+    pub(crate) fn position(&self, previous: Option<&FeedPosition>) -> FeedPosition {
+        FeedPosition {
+            cursor: self.next_cursor.clone(),
+            anchor: self
+                .changes
+                .last()
+                .map(|change| change.mutation_id.clone())
+                .or_else(|| previous.and_then(|position| position.anchor.clone())),
+        }
+    }
 }
 
 fn sequence(cursor: &str) -> Result<u64, LastSeekError> {
@@ -154,6 +175,13 @@ impl Source<'_> {
 
     pub(crate) fn identity(&self) -> Result<SourceIdentity, LastSeekError> {
         self.request("/api/system/boot-identity", &[], None)
+    }
+
+    pub(crate) fn require_boot(&self, boot: &SourceIdentity) -> Result<(), LastSeekError> {
+        if self.identity()? != *boot {
+            return Err(invalid("LastDB restarted during the read; retry the drain"));
+        }
+        Ok(())
     }
 
     pub(crate) fn projections(
@@ -301,6 +329,9 @@ impl Source<'_> {
             if prior.is_some_and(|prior| prior.checked_add(1) != Some(next)) {
                 return Err(LastSeekError::OnlineFeedGap);
             }
+            if change.mutation_id.is_empty() {
+                return Err(invalid("LastDB returned a change without a mutation ID"));
+            }
             prior = Some(next);
         }
         let next = sequence(&page.next_cursor)?;
@@ -310,14 +341,34 @@ impl Source<'_> {
         Ok(page)
     }
 
-    pub(crate) fn head(&self) -> Result<String, LastSeekError> {
-        let mut cursor = None;
+    pub(crate) fn anchor_at(&self, cursor: &str) -> Result<Option<String>, LastSeekError> {
+        let Some(before) = sequence(cursor)?.checked_sub(1) else {
+            return Ok(None);
+        };
+        let before = format!("v1-{before:016x}");
+        match self.changes(Some(&before), 1) {
+            Ok(page) => Ok(page
+                .changes
+                .into_iter()
+                .find(|change| change.cursor == cursor)
+                .map(|change| change.mutation_id)),
+            Err(LastSeekError::OnlineFeedGap) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn head(&self) -> Result<FeedPosition, LastSeekError> {
+        let mut position: Option<FeedPosition> = None;
         for _ in 0..1_000 {
-            let page = self.changes(cursor.as_deref(), FEED_PAGE)?;
+            let page = self.changes(
+                position.as_ref().map(|position| position.cursor.as_str()),
+                FEED_PAGE,
+            )?;
+            let next = page.position(position.as_ref());
             if !page.has_more {
-                return Ok(page.next_cursor);
+                return Ok(next);
             }
-            cursor = Some(page.next_cursor);
+            position = Some(next);
         }
         Err(invalid(
             "could not reach the LastDB change feed head within the page limit",

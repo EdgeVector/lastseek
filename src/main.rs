@@ -443,8 +443,8 @@ fn run() -> Result<(), LastSeekError> {
                 "the online index uses LastDB as its source".into(),
             ));
         }
-        if matches!(cmd.as_str(), "query" | "drain") && checkpoint.needs_rebuild() {
-            return Err(LastSeekError::OnlineFeedGap);
+        if cmd == "query" {
+            checkpoint.require_ready()?;
         }
     } else {
         lastseek::search_queue::check_command(&args, &cmd, &dir)?;
@@ -687,6 +687,7 @@ fn run() -> Result<(), LastSeekError> {
                             }),
                         },
                         "needs_rebuild": needs_rebuild,
+                        "online_recovery": checkpoint.map(|state| state.recovery_status()),
                         "embedder_id": store.embedder_id(),
                         "dimensions": store.dimensions(),
                         "committed_rows": store.committed_rows(),
@@ -843,13 +844,22 @@ fn run() -> Result<(), LastSeekError> {
                     return Err(LastSeekError::Online("--max-files must be positive".into()));
                 }
                 let mut embedder = embedder_for(VectorStore::open(&dir)?.embedder_id())?;
-                let result = lastseek::online::drain(
+                let attempt = lastseek::online::drain(
                     &dir,
                     checkpoint.clone(),
                     &table,
                     embedder.as_mut(),
                     max,
-                )?;
+                );
+                let result = match attempt {
+                    Err(LastSeekError::OnlineFeedGap) => {
+                        // The rebuild needs the exclusive publication lock.
+                        // Release this selection while retaining the drain lock.
+                        drop(selection);
+                        lastseek::online::recover(&root, &table, embedder.as_mut())?
+                    }
+                    result => result?,
+                };
                 println!("{}", serde_json::to_string_pretty(&result)?);
                 return Ok(());
             }

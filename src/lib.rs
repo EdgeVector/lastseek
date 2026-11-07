@@ -26,7 +26,7 @@ use thiserror::Error;
 pub enum LastSeekError {
     #[error("online index: {0}")]
     Online(String),
-    #[error("the LastDB change feed or source changed; run lastseek rebuild")]
+    #[error("the LastDB change feed has a gap; the online drain can rebuild the index")]
     OnlineFeedGap,
     #[error("Search rebuild required: LastDB stopped the change feed after Search was disabled or its queue reached the limit. Rebuild a fresh LastSeek store from all current LastDB records before the owner clears .rebuild-required; database writes continue.")]
     SearchRebuildRequired,
