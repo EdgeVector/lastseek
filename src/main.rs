@@ -94,6 +94,34 @@ fn flag_value(args: &[String], name: &str) -> Option<String> {
         .cloned()
 }
 
+/// A published Brain index serves its own explicit schema scopes. Explicit
+/// stores and inboxes keep their original meaning for all callers.
+fn brain_query_index(
+    args: &[String],
+    root: &std::path::Path,
+) -> Result<Option<lastseek::online::Selection>, LastSeekError> {
+    if flag_value(args, "--home").is_some()
+        || std::env::var_os("LASTSEEK_HOME").is_some()
+        || flag_value(args, "--inbox").is_some()
+    {
+        return Ok(None);
+    }
+    let schemas = flag_values(args, "--schema");
+    if schemas.is_empty() || schemas.iter().any(|schema| !schema.starts_with("brain/")) {
+        return Ok(None);
+    }
+    let brain_root = root.with_file_name("brain-index");
+    if !brain_root.is_dir() {
+        return Ok(None);
+    }
+    let selected = lastseek::online::select(&brain_root)?;
+    Ok(selected
+        .checkpoint
+        .as_ref()
+        .is_some_and(|state| state.covers(&schemas))
+        .then_some(selected))
+}
+
 /// Parse a flag's value as `T`, erroring on a present-but-malformed value
 /// rather than silently falling back to a default — `--k abc` used to fall
 /// back to 20 and `--min-score foo` used to silently disable the floor.
@@ -390,12 +418,19 @@ fn run() -> Result<(), LastSeekError> {
     let _updates = matches!(cmd.as_str(), "drain" | "compact" | "add")
         .then(|| lastseek::online::lock_updates(&root))
         .transpose()?;
-    let selection = matches!(
-        cmd.as_str(),
-        "status" | "doctor" | "query" | "drain" | "compact" | "add" | "coverage-declare"
-    )
-    .then(|| lastseek::online::select(&root))
-    .transpose()?;
+    let selection = if cmd == "query" {
+        match brain_query_index(&args, &root)? {
+            Some(selected) => Some(selected),
+            None => Some(lastseek::online::select(&root)?),
+        }
+    } else {
+        matches!(
+            cmd.as_str(),
+            "status" | "doctor" | "drain" | "compact" | "add" | "coverage-declare"
+        )
+        .then(|| lastseek::online::select(&root))
+        .transpose()?
+    };
     let dir = selection
         .as_ref()
         .map_or_else(|| root.clone(), |selected| selected.dir.clone());
