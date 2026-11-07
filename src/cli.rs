@@ -173,6 +173,7 @@ machine down on 2026-08-07.
 
 After an online rebuild, drain reads the durable feed and --max-files caps
 the number of change events. File consumption only applies to inbox stores.
+The online drain resumes after a verified LastDB restart and rebuilds on a gap.
 ",
         value_flags: &["--table", "--inbox", "--max-files"],
         bool_flags: &["--consume"],

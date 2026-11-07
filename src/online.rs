@@ -3,7 +3,8 @@
 use crate::embed::Embedder;
 use crate::ingest::{Batch, IndexChange, KeyValue};
 use crate::live_source::{
-    changed_keys, invalid, FeedPage, Key, Projection, Source, SourceIdentity, FEED_PAGE, KEY_PAGE,
+    changed_keys, invalid, FeedPage, FeedPosition, Key, Projection, Source, SourceIdentity,
+    FEED_PAGE, KEY_PAGE,
 };
 use crate::metrics::{self, LastDrain};
 use crate::schema::SchemaTable;
@@ -31,8 +32,34 @@ pub struct Checkpoint {
     source: SourceIdentity,
     names: Vec<String>,
     projections: BTreeMap<String, Projection>,
-    cursor: String,
+    #[serde(flatten)]
+    position: FeedPosition,
     needs_rebuild: bool,
+    #[serde(default)]
+    recovery: Recovery,
+}
+
+#[derive(Clone, Default, Serialize, Deserialize)]
+struct Recovery {
+    resumed_restarts: u64,
+    gap_rebuilds: u64,
+    blocked_by: Option<Block>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum Block {
+    FeedGap,
+    SchemaChanged,
+}
+
+impl Block {
+    fn error(self) -> LastSeekError {
+        match self {
+            Self::FeedGap => LastSeekError::OnlineFeedGap,
+            Self::SchemaChanged => invalid("searchable schemas changed; run lastseek rebuild"),
+        }
+    }
 }
 
 impl Checkpoint {
@@ -41,7 +68,30 @@ impl Checkpoint {
     }
 
     pub fn cursor(&self) -> &str {
-        &self.cursor
+        &self.position.cursor
+    }
+
+    pub fn recovery_status(&self) -> Value {
+        json!({
+            "anchored": self.position.anchor.is_some(),
+            "resumed_restarts": self.recovery.resumed_restarts,
+            "gap_rebuilds": self.recovery.gap_rebuilds,
+            "blocked_by": self.recovery.blocked_by,
+        })
+    }
+
+    pub fn require_ready(&self) -> Result<(), LastSeekError> {
+        if self.needs_rebuild {
+            return Err(self.recovery.blocked_by.unwrap_or(Block::FeedGap).error());
+        }
+        Ok(())
+    }
+
+    fn block(&mut self, dir: &Path, reason: Block) -> Result<LastSeekError, LastSeekError> {
+        self.needs_rebuild = true;
+        self.recovery.blocked_by = Some(reason);
+        self.save(dir)?;
+        Ok(reason.error())
     }
 
     pub fn covers(&self, schemas: &[String]) -> bool {
@@ -120,10 +170,7 @@ pub fn select(root: &Path) -> Result<Selection, LastSeekError> {
 
 pub fn ensure_current(dir: &Path) -> Result<(), LastSeekError> {
     let checkpoint: Checkpoint = serde_json::from_slice(&fs::read(dir.join(STATE))?)?;
-    if checkpoint.needs_rebuild {
-        return Err(LastSeekError::OnlineFeedGap);
-    }
-    Ok(())
+    checkpoint.require_ready()
 }
 
 fn require_scope(
@@ -170,7 +217,17 @@ impl Importer<'_> {
         projection: &Projection,
         keys: &[Key],
     ) -> Result<Applied, LastSeekError> {
-        let mut applied = Applied::default();
+        let ops = self.read_ops(schema, projection, keys)?;
+        self.apply(&ops)
+    }
+
+    fn read_ops(
+        &mut self,
+        schema: &str,
+        projection: &Projection,
+        keys: &[Key],
+    ) -> Result<Vec<PendingOp>, LastSeekError> {
+        let mut ops = Vec::new();
         for keys in keys.chunks(KEY_PAGE) {
             let mut rows = self.source.records(schema, keys, projection)?;
             let batch = Batch {
@@ -212,40 +269,48 @@ impl Importer<'_> {
             if vectors.len() != texts.len() {
                 return Err(invalid("embedder returned an incomplete vector batch"));
             }
-            let stats = Applied {
-                records: vectors.len(),
-                tombstones: batch.tombstones.len(),
-            };
-            let ops: Vec<_> = batch
-                .records
-                .into_iter()
-                .zip(vectors)
-                .map(|(record, vector)| PendingOp {
-                    record,
-                    vector: Some(vector),
-                })
-                .chain(batch.tombstones.into_iter().map(|record| PendingOp {
-                    record,
-                    vector: None,
-                }))
-                .collect();
-            self.store.append(&ops)?;
-            applied.include(stats);
+            ops.extend(
+                batch
+                    .records
+                    .into_iter()
+                    .zip(vectors)
+                    .map(|(record, vector)| PendingOp {
+                        record,
+                        vector: Some(vector),
+                    })
+                    .chain(batch.tombstones.into_iter().map(|record| PendingOp {
+                        record,
+                        vector: None,
+                    })),
+            );
         }
-        Ok(applied)
+        Ok(ops)
+    }
+
+    fn apply(&mut self, ops: &[PendingOp]) -> Result<Applied, LastSeekError> {
+        self.store.append(ops)?;
+        let records = ops.iter().filter(|op| op.vector.is_some()).count();
+        Ok(Applied {
+            records,
+            tombstones: ops.len() - records,
+        })
     }
 
     fn replay(
         &mut self,
         page: &FeedPage,
         projections: &BTreeMap<String, Projection>,
+        boot: &SourceIdentity,
     ) -> Result<Applied, LastSeekError> {
-        let mut applied = Applied::default();
+        let mut ops = Vec::new();
         for (schema, keys) in changed_keys(page, projections)? {
             let keys: Vec<_> = keys.into_iter().collect();
-            applied.include(self.read(&schema, &projections[&schema], &keys)?);
+            ops.extend(self.read_ops(&schema, &projections[&schema], &keys)?);
         }
-        Ok(applied)
+        // A restart between the feed read and hydration must not append
+        // records from a different source to the active generation.
+        self.source.require_boot(boot)?;
+        self.apply(&ops)
     }
 }
 
@@ -263,18 +328,64 @@ pub fn rebuild(
     table: &SchemaTable,
     embedder: &mut dyn Embedder,
 ) -> Result<Value, LastSeekError> {
-    let started = Instant::now();
     let _rebuild = lock(root, "rebuild.lock", true)?;
+    let recovery = select(root)?
+        .checkpoint
+        .map(|state| state.recovery)
+        .unwrap_or_default();
+    rebuild_locked(root, socket, names, table, embedder, recovery, None)
+}
+
+pub fn recover(
+    root: &Path,
+    table: &SchemaTable,
+    embedder: &mut dyn Embedder,
+) -> Result<Value, LastSeekError> {
+    let _rebuild = lock(root, "rebuild.lock", true)?;
+    let state = select(root)?
+        .checkpoint
+        .ok_or_else(|| invalid("online index is missing"))?;
+    if !state.needs_rebuild {
+        return Ok(json!({"ok":true, "source":"lastdb-change-feed",
+            "applied_through":state.cursor(), "recovery":state.recovery_status()}));
+    }
+    if state.recovery.blocked_by == Some(Block::SchemaChanged) {
+        state.require_ready()?;
+    }
+    rebuild_locked(
+        root,
+        &state.socket,
+        &state.names,
+        table,
+        embedder,
+        state.recovery,
+        Some(&state.projections),
+    )
+}
+
+fn rebuild_locked(
+    root: &Path,
+    socket: &Path,
+    names: &[String],
+    table: &SchemaTable,
+    embedder: &mut dyn Embedder,
+    mut recovery: Recovery,
+    previous_projections: Option<&BTreeMap<String, Projection>>,
+) -> Result<Value, LastSeekError> {
+    let started = Instant::now();
     let source = Source(socket);
     let identity = source.identity()?;
     let projections = source.projections(names, table)?;
+    if previous_projections.is_some_and(|previous| *previous != projections) {
+        return Err(invalid("searchable schemas changed; run lastseek rebuild"));
+    }
     if projections.is_empty() || names.iter().any(|name| !projections.contains_key(name)) {
         return Err(invalid(
             "rebuild requires available, explicitly searchable local Brain schemas",
         ));
     }
     require_scope(&select(root)?.dir, &projections)?;
-    let mut cursor = source.head()?;
+    let mut position = source.head()?;
 
     let control = root.join(ONLINE);
     let slot = if active(root)? == Some("a") { "b" } else { "a" };
@@ -320,10 +431,10 @@ pub fn rebuild(
         }
         loop {
             within_budget(started)?;
-            let page = importer.source.changes(Some(&cursor), FEED_PAGE)?;
+            let page = importer.source.changes(Some(&position.cursor), FEED_PAGE)?;
             feed_events += page.changes.len();
-            tail.include(importer.replay(&page, &projections)?);
-            cursor = page.next_cursor;
+            tail.include(importer.replay(&page, &projections, &identity)?);
+            position = page.position(Some(&position));
             if importer.store.pending_ops() >= COMPACT_AT {
                 importer.store.compact()?;
             }
@@ -342,14 +453,20 @@ pub fn rebuild(
     }
     // Verify the next page is still available after compaction. Later changes
     // remain for drain, which starts at the exact published cursor.
-    source.changes(Some(&cursor), 1)?;
+    source.changes(Some(&position.cursor), 1)?;
+    source.require_boot(&identity)?;
+    recovery.blocked_by = None;
+    if previous_projections.is_some() {
+        recovery.gap_rebuilds = recovery.gap_rebuilds.saturating_add(1);
+    }
     let checkpoint = Checkpoint {
         socket: socket.to_owned(),
         source: identity,
         names: names.to_vec(),
         projections,
-        cursor,
+        position,
         needs_rebuild: false,
+        recovery,
     };
     checkpoint.save(&stage)?;
     sync_dir(&control)?;
@@ -362,7 +479,8 @@ pub fn rebuild(
     Ok(json!({
         "ok":true, "schemas":checkpoint.projections.keys().collect::<Vec<_>>(),
         "key_pages":key_pages, "indexed":base, "replayed":tail, "feed_events":feed_events,
-        "applied_through":checkpoint.cursor, "committed_rows":committed,
+        "source":"lastdb-change-feed", "applied_through":checkpoint.cursor(), "committed_rows":committed,
+        "recovery":checkpoint.recovery_status(),
     }))
 }
 
@@ -373,17 +491,29 @@ pub fn drain(
     embedder: &mut dyn Embedder,
     mut remaining_budget: usize,
 ) -> Result<Value, LastSeekError> {
-    if checkpoint.needs_rebuild {
-        return Err(LastSeekError::OnlineFeedGap);
-    }
-    let source = Source(&checkpoint.socket);
+    checkpoint.require_ready()?;
+    let socket = checkpoint.socket.clone();
+    let source = Source(&socket);
     let identity = source.identity()?;
-    if identity != checkpoint.source
-        || source.projections(&checkpoint.names, table)? != checkpoint.projections
-    {
-        checkpoint.needs_rebuild = true;
-        checkpoint.save(dir)?;
-        return Err(LastSeekError::OnlineFeedGap);
+    let projections = source.projections(&checkpoint.names, table)?;
+    let restarted = identity != checkpoint.source;
+    let observed_anchor = if restarted || checkpoint.position.anchor.is_none() {
+        source.anchor_at(checkpoint.cursor())?
+    } else {
+        None
+    };
+    source.require_boot(&identity)?;
+    if projections != checkpoint.projections {
+        return Err(checkpoint.block(dir, Block::SchemaChanged)?);
+    }
+    if restarted {
+        if observed_anchor.is_none() || observed_anchor != checkpoint.position.anchor {
+            return Err(checkpoint.block(dir, Block::FeedGap)?);
+        }
+    } else if checkpoint.position.anchor.is_none() {
+        // Existing checkpoints acquire an anchor while their original daemon
+        // is still serving. Across a restart an unsigned cursor is ambiguous.
+        checkpoint.position.anchor = observed_anchor;
     }
     let mut store = VectorStore::open(dir)?;
     store.bind_embedder(embedder)?;
@@ -399,25 +529,24 @@ pub fn drain(
     while remaining_budget > 0 && has_more {
         let page = match importer
             .source
-            .changes(Some(&checkpoint.cursor), remaining_budget.min(FEED_PAGE))
+            .changes(Some(checkpoint.cursor()), remaining_budget.min(FEED_PAGE))
         {
             Err(LastSeekError::OnlineFeedGap) => {
-                checkpoint.needs_rebuild = true;
-                checkpoint.save(dir)?;
-                return Err(LastSeekError::OnlineFeedGap);
+                importer.source.require_boot(&identity)?;
+                return Err(checkpoint.block(dir, Block::FeedGap)?);
             }
             result => result?,
         };
-        applied.include(importer.replay(&page, &checkpoint.projections)?);
-        if importer.source.identity()? != checkpoint.source {
-            checkpoint.needs_rebuild = true;
-            checkpoint.save(dir)?;
-            return Err(LastSeekError::OnlineFeedGap);
-        }
+        applied.include(importer.replay(&page, &checkpoint.projections, &identity)?);
         remaining_budget = remaining_budget.saturating_sub(page.changes.len());
         events += page.changes.len();
         has_more = page.has_more;
-        checkpoint.cursor = page.next_cursor;
+        if checkpoint.source != identity {
+            checkpoint.recovery.resumed_restarts =
+                checkpoint.recovery.resumed_restarts.saturating_add(1);
+            checkpoint.source = identity.clone();
+        }
+        checkpoint.position = page.position(Some(&checkpoint.position));
         checkpoint.save(dir)?;
     }
     let compacted = store.pending_ops() >= COMPACT_AT;
@@ -437,6 +566,7 @@ pub fn drain(
         "ok":true, "source":"lastdb-change-feed", "files":0, "events":events,
         "records":applied.records, "tombstones":applied.tombstones,
         "remaining":usize::from(has_more), "has_more":has_more, "unreadable":[],
-        "applied_through":checkpoint.cursor, "pending_ops":store.pending_ops(),
+        "applied_through":checkpoint.cursor(), "pending_ops":store.pending_ops(),
+        "recovery":checkpoint.recovery_status(),
     }))
 }

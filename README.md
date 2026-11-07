@@ -9,9 +9,13 @@ lastseek rebuild
 LastSeek lists primary keys, reads the current records in batches, and catches
 up on LastDB's durable app change feed. It builds the replacement separately
 and publishes the vectors and feed cursor together. The existing `lastseek
-drain` command then follows that cursor, including updates and deletions. A
-feed gap, changed schema definitions, or a different LastDB boot requires
-another rebuild. LastSeek reports that condition in `status`.
+drain` command then follows that cursor, including updates and deletions.
+After LastDB restarts, the drain checks the saved cursor's mutation ID and
+continues from that cursor when it matches. A gap or an unverifiable cursor
+starts a replacement index while LastDB stays online. A socket failure can
+be retried from the same checkpoint. Changed searchable schema definitions
+require an explicit rebuild. `lastseek status` reports the saved anchor,
+resumed restarts and completed gap rebuilds for the online store.
 
 This workflow covers searchable Brain schemas and ordinary local writes.
 On a machine where the default index serves other apps too, run
