@@ -130,6 +130,11 @@ pub struct ResolvedScope {
 }
 
 impl SchemaTable {
+    pub(crate) fn include_scope(&mut self, name: &str, identity: &str) {
+        self.by_name.insert(name.into(), identity.into());
+        self.identities.insert(identity.into());
+    }
+
     /// Build from a `/v1/schemas/available` response body.
     ///
     /// Entries with no `identity_hash` fall back to their `name` as the

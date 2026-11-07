@@ -1,5 +1,26 @@
 # LastSeek
 
+For local Brain records, rebuild the index while LastDB is running:
+
+```sh
+lastseek rebuild
+```
+
+LastSeek lists primary keys, reads the current records in batches, and catches
+up on LastDB's durable app change feed. It builds the replacement separately
+and publishes the vectors and feed cursor together. The existing `lastseek
+drain` command then follows that cursor, including updates and deletions. A
+feed gap, changed schema definitions, or a different LastDB boot requires
+another rebuild. LastSeek reports that condition in `status`.
+
+This workflow covers searchable Brain schemas and ordinary local writes.
+Use `--home DIR --schema brain/Reference` for a separate scoped index.
+The rebuild refuses to replace an index that contains vectors outside its
+scope. Shared peer replay and concurrent schema maintenance are outside this
+workflow because the app change feed does not account for those paths.
+
+### File inbox
+
 LastDB Search delivery is off by default. Start LastDB with `lastdbd --enable-search` when this store needs its change feed.
 The live producer stops delivery at its queue limit and records `apps/search/inbox/.rebuild-required`.
 Database writes continue. LastSeek reports `needs_rebuild` and refuses queries and drains for that inbox until recovery completes.

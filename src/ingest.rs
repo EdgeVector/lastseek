@@ -90,7 +90,7 @@ pub struct Batch {
 /// No classifications means allow: the host omits them for most schemas, and
 /// defaulting to deny would empty the index. `searchable_fields`, when the batch
 /// carries it, is the narrower gate.
-fn field_is_indexable(classes: Option<&Vec<String>>) -> bool {
+pub(crate) fn field_is_indexable(classes: Option<&Vec<String>>) -> bool {
     let Some(classes) = classes else {
         return true;
     };
