@@ -217,6 +217,7 @@ LastDB is Dynamo-shaped: point get, range under one hash, **no scan**. So
 
 ```bash
 lastseek drain                  # apply the host's IndexChangeBatch feed
+# Current batches carry record_fields. Queued fields_and_values batches remain readable.
 lastseek add < records.jsonl    # an app feeding its own corpus
 ```
 
