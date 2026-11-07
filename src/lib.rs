@@ -12,7 +12,9 @@ pub mod coverage;
 pub mod embed;
 pub mod index;
 pub mod ingest;
+mod live_source;
 pub mod metrics;
+pub mod online;
 pub mod schema;
 pub mod search_queue;
 pub mod source_counts;
@@ -22,6 +24,10 @@ use thiserror::Error;
 
 #[derive(Debug, Error)]
 pub enum LastSeekError {
+    #[error("online index: {0}")]
+    Online(String),
+    #[error("the LastDB change feed or source changed; run lastseek rebuild")]
+    OnlineFeedGap,
     #[error("Search rebuild required: LastDB stopped the change feed after Search was disabled or its queue reached the limit. Rebuild a fresh LastSeek store from all current LastDB records before the owner clears .rebuild-required; database writes continue.")]
     SearchRebuildRequired,
     #[error("io: {0}")]

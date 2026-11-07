@@ -48,15 +48,3 @@ pub fn check_command(args: &[String], command: &str, home: &Path) -> Result<(), 
     }
     Ok(())
 }
-
-pub fn reported_state<'a>(
-    state: &'a str,
-    args: &[String],
-    home: &Path,
-) -> Result<&'a str, LastSeekError> {
-    Ok(if required(&inbox(args, home)?)? {
-        "rebuild_required"
-    } else {
-        state
-    })
-}

@@ -89,7 +89,7 @@ use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use crate::embed::Embedder;
@@ -424,7 +424,7 @@ pub const PRIVATE_FILE_MODE: u32 = 0o600;
 /// `mode` only applies when the file is created; an existing file keeps its
 /// mode. Every file this store writes is either created fresh inside a new
 /// staging directory or lives under the store root, which `open()` tightens.
-fn private_open_options() -> OpenOptions {
+pub(crate) fn private_open_options() -> OpenOptions {
     let mut opts = OpenOptions::new();
     #[cfg(unix)]
     {
@@ -507,20 +507,40 @@ fn durable_sync(file: &File) -> Result<(), LastSeekError> {
 }
 
 /// fsync a directory's own entry, so renames/creates inside it are durable.
-fn sync_dir(dir: &Path) -> Result<(), LastSeekError> {
+pub(crate) fn sync_dir(dir: &Path) -> Result<(), LastSeekError> {
     durable_sync(&File::open(dir)?)
 }
 
 fn load_pending(dir: &Path) -> Result<Vec<PendingOp>, LastSeekError> {
-    match std::fs::read_to_string(dir.join(LOG_FILE)) {
-        Ok(s) => Ok(s
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            // A torn tail costs the last op, never the log.
-            .filter_map(|l| serde_json::from_str::<PendingOp>(l).ok())
+    match std::fs::read(dir.join(LOG_FILE)) {
+        Ok(bytes) => Ok(bytes
+            .split_inclusive(|byte| *byte == b'\n')
+            .filter(|line| line.ends_with(b"\n"))
+            .filter_map(|line| serde_json::from_slice::<PendingOp>(line).ok())
             .collect()),
-        Err(_) => Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
+        Err(error) => Err(error.into()),
     }
+}
+
+/// A process can die midway through the final line. Keep the durable prefix
+/// and remove the fragment before appending again so it cannot swallow a retry.
+fn trim_pending_tail(file: &mut File) -> Result<(), LastSeekError> {
+    let mut end = file.metadata()?.len();
+    let mut buffer = [0_u8; 8192];
+    while end > 0 {
+        let size = end.min(buffer.len() as u64) as usize;
+        let start = end - size as u64;
+        file.seek(SeekFrom::Start(start))?;
+        file.read_exact(&mut buffer[..size])?;
+        if let Some(last) = buffer[..size].iter().rposition(|byte| *byte == b'\n') {
+            file.set_len(start + last as u64 + 1)?;
+            return Ok(());
+        }
+        end = start;
+    }
+    file.set_len(0)?;
+    Ok(())
 }
 
 /// Read side: the mmap'd slab plus the side-tables needed to interpret it.
@@ -809,10 +829,12 @@ impl VectorStore {
             }
         }
         let _guard = lock_writer(&self.dir)?;
-        let f = private_open_options()
+        let mut f = private_open_options()
             .create(true)
+            .read(true)
             .append(true)
             .open(self.dir.join(LOG_FILE))?;
+        trim_pending_tail(&mut f)?;
         {
             let mut w = BufWriter::new(&f);
             for op in ops {

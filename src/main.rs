@@ -26,6 +26,7 @@ usage:
                                       answers keys + scores; bodies stay in LastDB
   lastseek add [--home DIR]           read Records as JSONL on stdin, embed, append
   lastseek compact [--home DIR]       fold the pending log into the slab
+  lastseek rebuild [--home DIR]       rebuild local Brain search from live LastDB
   lastseek drain [--home DIR] [--inbox DIR] [--max-files N] [--consume]
                                       apply the host's IndexChangeBatch feed
   lastseek doctor [--home DIR]
@@ -366,8 +367,53 @@ fn run() -> Result<(), LastSeekError> {
         lastseek::cli::Invocation::Run => {}
     }
 
-    let dir = home(&args);
-    lastseek::search_queue::check_command(&args, &cmd, &dir)?;
+    let root = home(&args);
+    if cmd == "rebuild" {
+        let table = load_schema_table(&args);
+        let socket = std::path::absolute(lastdb_socket(&args))?;
+        let mut embedder = embedder_for("fastembed/bge-small-en-v1.5")?;
+        if embedder.id() != "fastembed/bge-small-en-v1.5" {
+            return Err(LastSeekError::Online(
+                "rebuild requires the BGE embedder".into(),
+            ));
+        }
+        let result = lastseek::online::rebuild(
+            &root,
+            &socket,
+            &flag_values(&args, "--schema"),
+            &table,
+            embedder.as_mut(),
+        )?;
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+    let _updates = matches!(cmd.as_str(), "drain" | "compact" | "add")
+        .then(|| lastseek::online::lock_updates(&root))
+        .transpose()?;
+    let selection = matches!(
+        cmd.as_str(),
+        "status" | "doctor" | "query" | "drain" | "compact" | "add" | "coverage-declare"
+    )
+    .then(|| lastseek::online::select(&root))
+    .transpose()?;
+    let dir = selection
+        .as_ref()
+        .map_or_else(|| root.clone(), |selected| selected.dir.clone());
+    let checkpoint = selection
+        .as_ref()
+        .and_then(|selected| selected.checkpoint.as_ref());
+    if let Some(checkpoint) = checkpoint {
+        if flag_value(&args, "--inbox").is_some() || cmd == "add" {
+            return Err(LastSeekError::Online(
+                "the online index uses LastDB as its source".into(),
+            ));
+        }
+        if matches!(cmd.as_str(), "query" | "drain") && checkpoint.needs_rebuild() {
+            return Err(LastSeekError::OnlineFeedGap);
+        }
+    } else {
+        lastseek::search_queue::check_command(&args, &cmd, &dir)?;
+    }
 
     match cmd.as_str() {
         "schema-table" => {
@@ -567,7 +613,7 @@ fn run() -> Result<(), LastSeekError> {
                     let mark = Watermark::load(&dir);
                     let lag = lastseek::ingest::freshness_lag_ms(&mark.applied_through);
                     let query_metrics = metrics::query_summary(&dir);
-                    let queue = if args.iter().any(|a| a == "--queue") {
+                    let queue = if checkpoint.is_none() && args.iter().any(|a| a == "--queue") {
                         let inbox = lastseek::search_queue::inbox(&args, &dir)?;
                         Some(lastseek::ingest::queue_stats(
                             &inbox,
@@ -576,10 +622,17 @@ fn run() -> Result<(), LastSeekError> {
                     } else {
                         None
                     };
+                    let needs_rebuild = match checkpoint {
+                        Some(checkpoint) => checkpoint.needs_rebuild(),
+                        None => lastseek::search_queue::required(&lastseek::search_queue::inbox(
+                            &args, &dir,
+                        )?)?,
+                    };
                     let out = serde_json::json!({
                         "ok": true,
-                        "state": lastseek::search_queue::reported_state(state, &args, &dir)?,
-                        "home": dir.to_string_lossy(),
+                        "state": if needs_rebuild { "rebuild_required" } else { state },
+                        "home": root.to_string_lossy(),
+                        "source": if checkpoint.is_some() { "lastdb-change-feed" } else { "inbox" },
                         // Absent, never zero, when nothing has been applied or
                         // the watermark carries no time prefix — "fresh" and
                         // "unknown" are different answers.
@@ -589,16 +642,16 @@ fn run() -> Result<(), LastSeekError> {
                         "timeout_count": query_metrics.timeout_count,
                         "callers": query_metrics.callers,
                         "last_drain": serde_json::to_value(metrics::last_drain(&dir))?,
-                        "applied_through": mark.applied_through,
+                        "applied_through": checkpoint.map_or(mark.applied_through.as_str(), |checkpoint| checkpoint.cursor()),
                         "files_applied": mark.files_applied,
                         "queue": match queue {
                             Some(q) => serde_json::to_value(q)?,
                             None => serde_json::json!({
                                 "available": false,
-                                "reason": "not requested — the queue reads the inbox directory, which has held 127k entries on this host; pass --queue",
+                                "reason": if checkpoint.is_some() { "the online index uses the durable feed" } else { "not requested; pass --queue" },
                             }),
                         },
-                        "needs_rebuild": lastseek::search_queue::required(&lastseek::search_queue::inbox(&args, &dir)?)?,
+                        "needs_rebuild": needs_rebuild,
                         "embedder_id": store.embedder_id(),
                         "dimensions": store.dimensions(),
                         "committed_rows": store.committed_rows(),
@@ -663,7 +716,10 @@ fn run() -> Result<(), LastSeekError> {
                 ));
             }
             let store = VectorStore::open(&dir)?;
-            let table = load_schema_table(&args);
+            let mut table = load_schema_table(&args);
+            if let Some(checkpoint) = checkpoint {
+                checkpoint.include_scopes(&mut table);
+            }
             let mut emb = embedder_for(store.embedder_id())?;
             let q = emb.embed_query(std::slice::from_ref(&text))?.remove(0);
             let opts = QueryOpts {
@@ -700,7 +756,11 @@ fn run() -> Result<(), LastSeekError> {
                     })
                 })
                 .collect();
-            lastseek::search_queue::check_command(&args, &cmd, &dir)?;
+            if checkpoint.is_none() {
+                lastseek::search_queue::check_command(&args, &cmd, &dir)?;
+            } else {
+                lastseek::online::ensure_current(&dir)?;
+            }
             println!(
                 "{}",
                 serde_json::to_string_pretty(&serde_json::json!({
@@ -740,11 +800,26 @@ fn run() -> Result<(), LastSeekError> {
             );
         }
         "drain" => {
-            let inbox = lastseek::search_queue::inbox(&args, &dir)?;
             let max = parse_flag::<usize>(&args, "--max-files")?
                 .unwrap_or(lastseek::ingest::DEFAULT_MAX_FILES);
-            let consume = args.iter().any(|a| a == "--consume");
             let table = load_schema_table(&args);
+            if let Some(checkpoint) = checkpoint {
+                if max == 0 {
+                    return Err(LastSeekError::Online("--max-files must be positive".into()));
+                }
+                let mut embedder = embedder_for(VectorStore::open(&dir)?.embedder_id())?;
+                let result = lastseek::online::drain(
+                    &dir,
+                    checkpoint.clone(),
+                    &table,
+                    embedder.as_mut(),
+                    max,
+                )?;
+                println!("{}", serde_json::to_string_pretty(&result)?);
+                return Ok(());
+            }
+            let inbox = lastseek::search_queue::inbox(&args, &dir)?;
+            let consume = args.iter().any(|a| a == "--consume");
             let mut mark = Watermark::load(&dir);
             let (files, remaining) =
                 lastseek::ingest::pending_batches(&inbox, &mark.applied_through, max)?;
