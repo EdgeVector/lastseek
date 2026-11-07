@@ -65,8 +65,8 @@ pub struct IndexChange {
     #[serde(default)]
     pub kind: String,
     pub key_value: KeyValue,
-    #[serde(default)]
-    pub fields_and_values: Option<BTreeMap<String, serde_json::Value>>,
+    #[serde(default, alias = "fields_and_values")]
+    pub record_fields: Option<BTreeMap<String, serde_json::Value>>,
 }
 
 /// One host-written batch.
@@ -218,7 +218,13 @@ impl Batch {
                 non_searchable_records_skipped += 1;
                 continue;
             }
-            let Some(fields) = change.fields_and_values.as_ref() else {
+            let Some(fields) = change.record_fields.as_ref() else {
+                if change.kind == "upsert" {
+                    tombstones.push(Record {
+                        deleted: true,
+                        ..base
+                    });
+                }
                 continue;
             };
             let text = fields_to_text(
@@ -227,9 +233,12 @@ impl Batch {
                 self.classifications.as_ref(),
             );
             if text.trim().is_empty() {
-                // Nothing to embed. Not an error and not a skip worth
-                // reporting: a record whose only fields are numbers and ids
-                // legitimately has no prose.
+                // A complete replacement can remove all searchable content.
+                // Retire its previous vector when there is nothing to embed.
+                tombstones.push(Record {
+                    deleted: true,
+                    ..base
+                });
                 continue;
             }
             records.push(Record { text, ..base });

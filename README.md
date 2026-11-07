@@ -12,7 +12,13 @@ Do not clear the marker or resume old queued batches into that rebuilt store bef
 Unseen deletes can leave old Search records, so a partial drain or count match is not sufficient.
 The owner clears the old queue and removes the marker last, then resumes LastDB with Search enabled.
 Use an explicit export inbox for recovery so the live inbox remains blocked.
-See [the LastDB option and recovery steps](https://github.com/EdgeVector/lastdb/blob/main/docs/lastdb-optional-search.md).
+The offline exporter is `lastdb admin search-rebuild --json`. It refuses a running daemon and
+writes the current records to `LASTDB_HOME/apps/search/inbox`. Keep the old queue separate
+from this export. Drain the export explicitly into a fresh store with `lastseek drain --home DIR
+--inbox EXPORT --max-files 500`; a fresh neural store also requires `LASTSEEK_EMBEDDER=bge`.
+Repeat bounded drains until `remaining` is zero, check that no batch was unreadable, then compact
+and verify the fresh store before promoting it. Promotion must restore the store's saved source
+inbox to the live inbox. Stopping or restarting a shared database requires its owner's approval.
 
 Memory-mapped semantic vector search for LastDB. Canonical remote
 `https://github.com/EdgeVector/lastseek` (GitHub, private).
@@ -217,6 +223,7 @@ LastDB is Dynamo-shaped: point get, range under one hash, **no scan**. So
 
 ```bash
 lastseek drain                  # apply the host's IndexChangeBatch feed
+# Current batches carry record_fields. Queued fields_and_values batches remain readable.
 lastseek add < records.jsonl    # an app feeding its own corpus
 ```
 
