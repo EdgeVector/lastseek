@@ -86,7 +86,6 @@
 
 use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
-use std::cell::Cell;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs::{File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
@@ -287,103 +286,6 @@ impl RowMeta {
     }
 }
 
-/// Table-driven crash simulation for `compact()`, gated behind a cargo
-/// feature so no fault-injection code links into a default build.
-#[cfg(feature = "fault-injection")]
-pub mod fault {
-    use std::cell::Cell;
-
-    /// Every interior point of `compact()` where a crash is distinguishable
-    /// from any other: everything before `AfterStagingDirFsync` is still
-    /// invisible garbage (nothing references the staging dir yet), and
-    /// everything from `AfterCurrentRename` onward has already committed to
-    /// the new generation. Keep `ALL` in lockstep with `compact()` — the
-    /// matrix test asserts the count so a new interior step fails the build
-    /// until it gets a case.
-    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-    #[repr(u8)]
-    pub enum FaultPoint {
-        AfterStagingBuild = 0,
-        AfterStagingDirFsync = 1,
-        AfterGenerationRename = 2,
-        AfterGenerationRenameFsync = 3,
-        AfterCurrentTmpWritten = 4,
-        AfterCurrentRename = 5,
-        AfterCurrentRenameFsync = 6,
-        AfterPendingRemoved = 7,
-    }
-
-    impl FaultPoint {
-        pub const ALL: &'static [FaultPoint] = &[
-            FaultPoint::AfterStagingBuild,
-            FaultPoint::AfterStagingDirFsync,
-            FaultPoint::AfterGenerationRename,
-            FaultPoint::AfterGenerationRenameFsync,
-            FaultPoint::AfterCurrentTmpWritten,
-            FaultPoint::AfterCurrentRename,
-            FaultPoint::AfterCurrentRenameFsync,
-            FaultPoint::AfterPendingRemoved,
-        ];
-    }
-
-    thread_local! {
-        // Thread-local, not a shared global: cargo test runs each #[test] on
-        // its own thread, and compact() calls from unrelated tests must
-        // never see this test's armed fault point.
-        static ARMED: Cell<u8> = const { Cell::new(255) };
-        // Counts calls into `durable_sync`, i.e. every fsync that actually ran.
-        // A crash (panic) proves ordering, not durability — the OS page cache
-        // survives a panic regardless of whether the fsync below it ran. This
-        // counter is the thing that catches a future edit silently dropping a
-        // sync: the matrix test asserts the exact expected count.
-        static SYNC_COUNT: Cell<usize> = const { Cell::new(0) };
-    }
-
-    /// Arm the next `compact()` call **on this thread** to panic once it
-    /// reaches `point`.
-    pub fn arm(point: FaultPoint) {
-        ARMED.with(|a| a.set(point as u8));
-    }
-
-    pub fn disarm() {
-        ARMED.with(|a| a.set(255));
-    }
-
-    pub(crate) fn maybe_fire(point: FaultPoint) {
-        let armed = ARMED.with(|a| a.get());
-        if armed == point as u8 {
-            disarm();
-            panic!("fault-injection: simulated crash at {point:?}");
-        }
-    }
-
-    pub(crate) fn record_sync() {
-        SYNC_COUNT.with(|c| c.set(c.get() + 1));
-    }
-
-    /// Zero the sync counter on this thread. Call before the operation under
-    /// test so an unrelated setup call (e.g. `append`) doesn't inflate the count.
-    pub fn reset_sync_count() {
-        SYNC_COUNT.with(|c| c.set(0));
-    }
-
-    /// Durability syncs recorded since the last `reset_sync_count`.
-    pub fn sync_count() -> usize {
-        SYNC_COUNT.with(|c| c.get())
-    }
-}
-
-#[cfg(feature = "fault-injection")]
-macro_rules! fault_point {
-    ($point:expr) => {
-        fault::maybe_fire($point)
-    };
-}
-#[cfg(not(feature = "fault-injection"))]
-macro_rules! fault_point {
-    ($point:expr) => {};
-}
-
 /// Advisory cross-process mutual exclusion for the mutating half of the API
 /// (`append`, `compact`). Held for the whole call, closing the race where a
 /// concurrent append's op could be lost by a compaction that read the log
@@ -495,14 +397,9 @@ pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), Last
     Ok(())
 }
 
-/// `File::sync_all`, counted under `fault-injection` so the compaction fault
-/// matrix can assert that every durability-critical sync actually ran instead
-/// of only proving crash-ordering (see the module doc's "process-crash vs.
-/// power-loss" section).
+/// `File::sync_all`.
 fn durable_sync(file: &File) -> Result<(), LastSeekError> {
     file.sync_all()?;
-    #[cfg(feature = "fault-injection")]
-    fault::record_sync();
     Ok(())
 }
 
@@ -554,10 +451,6 @@ pub struct VectorStore {
     meta_map: Option<Mmap>,
     /// Uncommitted ops, replayed over the slab on read.
     pending: Vec<PendingOp>,
-    /// Counts calls that actually parsed a line out of `meta.jsonl`. Exists so
-    /// tests can prove residency as a deterministic count instead of an RSS
-    /// measurement.
-    meta_reads: Cell<usize>,
 }
 
 impl VectorStore {
@@ -651,7 +544,6 @@ impl VectorStore {
             rows_map,
             meta_map,
             pending,
-            meta_reads: Cell::new(0),
         })
     }
 
@@ -686,12 +578,6 @@ impl VectorStore {
     /// Bytes the text segment occupies on disk, for residency diagnostics.
     pub fn meta_bytes(&self) -> u64 {
         self.manifest.meta_bytes
-    }
-
-    /// How many times a call actually parsed a `meta.jsonl` line. Resets on
-    /// reopen; exists for the residency test, not general use.
-    pub fn meta_reads(&self) -> usize {
-        self.meta_reads.get()
     }
 
     /// Interned id for a schema identity key, if any committed row uses it.
@@ -797,7 +683,6 @@ impl VectorStore {
         if end > map.len() {
             return None;
         }
-        self.meta_reads.set(self.meta_reads.get() + 1);
         serde_json::from_slice(&map[start..end]).ok()
     }
 
@@ -855,9 +740,6 @@ impl VectorStore {
     /// at any point up to the final `CURRENT` rename leaves the previous
     /// generation, and the pending log, entirely intact and re-compactable.
     pub fn compact(&mut self) -> Result<(), LastSeekError> {
-        #[cfg(feature = "fault-injection")]
-        use fault::FaultPoint;
-
         let _guard = lock_writer(&self.dir)?;
 
         // Re-read fresh under the lock: a concurrent process may have
@@ -922,19 +804,15 @@ impl VectorStore {
             let _ = std::fs::remove_dir_all(&staging);
             return Err(e);
         }
-        fault_point!(FaultPoint::AfterStagingBuild);
 
         sync_dir(&staging)?;
-        fault_point!(FaultPoint::AfterStagingDirFsync);
 
         let final_dir = self.dir.join(gen_dir_name(new_generation));
         if final_dir.exists() {
             std::fs::remove_dir_all(&final_dir)?;
         }
         std::fs::rename(&staging, &final_dir)?;
-        fault_point!(FaultPoint::AfterGenerationRename);
         sync_dir(&self.dir)?;
-        fault_point!(FaultPoint::AfterGenerationRenameFsync);
 
         // Drop mappings before the pointer swap so this handle never mixes
         // an old view with the new generation once CURRENT moves.
@@ -948,17 +826,13 @@ impl VectorStore {
             f.write_all(new_generation.to_string().as_bytes())?;
             durable_sync(&f)?;
         }
-        fault_point!(FaultPoint::AfterCurrentTmpWritten);
         std::fs::rename(&current_tmp, self.dir.join(CURRENT_FILE))?;
-        fault_point!(FaultPoint::AfterCurrentRename);
         sync_dir(&self.dir)?;
-        fault_point!(FaultPoint::AfterCurrentRenameFsync);
 
         // The generation swap is durable and every op is now represented in
         // it. Remove the log last, so a crash before this point always
         // leaves it fully intact and safely re-foldable.
         let _ = std::fs::remove_file(self.dir.join(LOG_FILE));
-        fault_point!(FaultPoint::AfterPendingRemoved);
 
         self.gc_old_generations(new_generation)?;
 

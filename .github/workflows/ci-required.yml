@@ -1,5 +1,5 @@
 # Merge gate and artifact publish for lastseek. Gate of record: GitHub (2026-09-30).
-# `check` runs .lastgit/ci.sh: fmt, clippy and a build with the explicit feature set
+# `check` runs .lastgit/ci.sh: fmt, clippy and a build with default features
 # (no `neural`: no ONNX Runtime download, no model weights in CI). `ci-required`
 # is the one required check. `publish` runs only on a push to main, after
 # ci-required, and builds the feature-complete darwin-arm64 binary on a macOS runner.

@@ -305,17 +305,9 @@ internal consistency alone.
 
 ## Embedders
 
-`LASTSEEK_EMBEDDER=deterministic` selects a fixture with no semantics that
-needs no downloaded weights.
 `LASTSEEK_EMBEDDER=bge` selects real neural embedding — `bge-small-en-v1.5`
 via the vendored FastEmbed crate (`vendor/fastembed-4.9.0-no-image`, the same
 fork `fold` uses) — and requires a build with `--features neural`.
-
-The fixture reports `is_neural() == false`, and that is deliberate: the
-predecessor let 2,021 deterministic hash vectors reach its production index,
-where they shared a space with neural ones and were scored against them as if
-comparable. The boundary must be refusable at write time rather than
-discoverable in a later coverage audit.
 
 BGE is **asymmetric**: `lastseek query` prepends the model's query
 instruction, `lastseek add` does not. Embedding the same text through both
