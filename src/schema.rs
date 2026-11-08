@@ -27,7 +27,7 @@
 //! Measured 2026-08-08 against the live primary and deployed prod SS: for the
 //! schemas that matter, **the node's `identity_hash` and SS's `identity_hash`
 //! disagree**, because the node recomputes the hash with whatever binary is
-//! running while SS's is a property of the registry. `fbrain`'s `Reference` is
+//! running while SS's is a property of the registry. Brain's `Reference` was
 //! `85fb0452…` on the node and `5c691083…` at SS — one row, joined on `name`,
 //! two hashes.
 //!
@@ -47,7 +47,7 @@ use serde::{Deserialize, Serialize};
 use crate::LastSeekError;
 
 /// Default Schema Service base URL (prod). Overridable with
-/// `LASTSEEK_SCHEMA_SERVICE_URL`; the dev stage lives in fold's
+/// `LASTSEEK_SCHEMA_SERVICE_URL`; the dev stage lives in lastdb's
 /// `folddb_profile/environments.json`, which is the org's single source of
 /// truth for these hostnames.
 pub const DEFAULT_SCHEMA_SERVICE_URL: &str =
@@ -57,7 +57,7 @@ pub const DEFAULT_SCHEMA_SERVICE_URL: &str =
 ///
 /// `/v1/registry/index` would be preferable — it is signed, ETagged, and
 /// compact — but it returns 404 on both deployed stages as of 2026-08-08: the
-/// route is in `schema_service/openapi.yaml` on fold `main` and has not been
+/// route is in `schema_service/openapi.yaml` in the lastdb tree and has not been
 /// deployed. Switch to it once it ships.
 pub const AVAILABLE_PATH: &str = "/v1/schemas/available";
 

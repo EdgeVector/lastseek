@@ -33,10 +33,9 @@ set -uo pipefail
 # `~/.local/bin` FIRST, and this directory is deliberately NOT on the path.
 #
 # It used to lead, back when `lastseek` was a hand-built binary living here.
-# Host Track now owns `~/.local/bin/lastseek` and points it at the CI-published
-# artifact, so leading with this directory would have pinned the drain to a
-# stale local build indefinitely — a binary with no freshness gate, silently
-# preferred over the managed one, on the one job that runs unattended forever.
+# ~/.local/bin/lastseek is the app-registry link to dist/lastseek, so leading
+# with this directory would pin the drain to a stale local build — a binary
+# with no freshness gate, preferred over the managed one, on the unattended job.
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 LOG="$HOME/.lastseek/drain.log"

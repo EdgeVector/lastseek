@@ -3,8 +3,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# LastGit runs under launchd, whose minimal PATH does not include rustup's
-# user-local toolchain by default.
+# The GitHub runner image does not put rustup's user-local toolchain on PATH.
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 command -v cargo >/dev/null
 
@@ -25,10 +24,9 @@ bash -n .lastgit/ci.sh
 bash -n .lastgit/artifact-release.sh
 
 # The feature-complete binary is built only by the separate `publish` job of
-# ci-required.yml (macOS runner, last-stack reusable workflow), which packs
-# these paths. The builder skips an entry whose context is not ci-required, so
-# the entry must carry no context. Keep this gate cheap while proving the
-# publication route cannot silently fall back to the slow build.
+# ci-required.yml (macOS runner, last-stack registry-app-package). That job
+# reads .last-stack/package.json. A context key would drop the entry, so this
+# gate proves the one darwin-arm64 package is present and has no context.
 jq -e '
   [.artifacts[]
     | select(
@@ -38,7 +36,7 @@ jq -e '
         and .paths == ["dist/lastseek", "lastseek.app.json", "LICENSE", "THIRD_PARTY_NOTICES"]
       )]
   | length == 1
-' .lastgit/artifacts.json >/dev/null
+' .last-stack/package.json >/dev/null
 
 # Public Homebrew binaries are Apache-2.0 (decision 2026-09-23). The license
 # files the release artifact carries must exist and agree with Cargo.toml.
@@ -62,11 +60,9 @@ fi
 #      gate's own contract — stated in Cargo.toml and README — is that CI links
 #      no inference runtime and fetches no weights. --all-features contradicted
 #      the thing it was supposed to protect.
-#   2. It times out. Compiling ort + the vendored fastembed graph in release
-#      takes ~11.5 minutes on this host, against LastGit's 600000ms CI timeout.
-#      Measured: cr-msjufz3p-b283 died exactly there
-#      (papercut-pipeline-stuck-cr-lastseek-cr-msjufz3p, P0), and every future
-#      Rust CR in this repo would have died the same way.
+#   2. It is slow. Compiling ort and the vendored fastembed graph in release
+#      takes about 11.5 minutes. That work belongs to the publish job, not
+#      the required gate.
 #
 # Keep `neural` out of the required gate. The tests are deleted (2026-10-09), so
 # the gate runs fmt, clippy and a build with default features.
@@ -81,4 +77,4 @@ cargo fmt --all -- --check
 cargo clippy --lib --bins -- -D warnings
 cargo build
 
-echo "lastgit ci gate PASSED"
+echo "lastseek ci gate PASSED"
