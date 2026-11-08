@@ -294,19 +294,17 @@ impl Watermark {
 
 /// Default inbox: the one the host's outbox sink already writes to.
 ///
-/// Deliberately `apps/search/inbox` and not a LastSeek-specific path. The sink's
-/// path lives in fold; changing it is a fold change and a separate slice, and
-/// until then a private inbox would simply never receive anything.
+/// Deliberately `apps/search/inbox` and not a LastSeek-specific path. The
+/// LastDB outbox sink writes that directory. A private inbox would receive
+/// nothing.
 pub fn default_inbox() -> PathBuf {
     if let Ok(v) = std::env::var("LASTSEEK_INBOX") {
         return v.into();
     }
-    let home = std::env::var("LASTDB_HOME")
-        .or_else(|_| std::env::var("FOLDDB_HOME"))
-        .unwrap_or_else(|_| {
-            let base = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-            format!("{base}/.lastdb")
-        });
+    let home = std::env::var("LASTDB_HOME").unwrap_or_else(|_| {
+        let base = std::env::var("HOME").unwrap_or_else(|_| ".".into());
+        format!("{base}/.lastdb")
+    });
     Path::new(&home).join("apps").join("search").join("inbox")
 }
 

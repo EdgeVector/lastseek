@@ -306,8 +306,8 @@ internal consistency alone.
 ## Embedders
 
 `LASTSEEK_EMBEDDER=bge` selects real neural embedding — `bge-small-en-v1.5`
-via the vendored FastEmbed crate (`vendor/fastembed-4.9.0-no-image`, the same
-fork `fold` uses) — and requires a build with `--features neural`.
+via the vendored FastEmbed crate (`vendor/fastembed-4.9.0-no-image`) and
+requires a build with `--features neural`.
 
 BGE is **asymmetric**: `lastseek query` prepends the model's query
 instruction, `lastseek add` does not. Embedding the same text through both
@@ -375,21 +375,22 @@ bash .lastgit/ci.sh
 ```
 
 The tests are deleted (2026-10-09). The gate runs `cargo fmt`, `cargo clippy
---all-targets`, and a build.
+--lib --bins`, and a build.
 
-The required gate builds an **explicit** feature set, not `--all-features`.
+The required gate uses default features, not `--all-features`.
 `--all-features` turns on `neural`, which downloads ONNX Runtime at build time
-(contradicting the gate's own weightless contract) and takes ~11.5 minutes in
-release — past LastGit's 600 s CI timeout.
+(contradicting the gate's own weightless contract) and takes about 11.5
+minutes in release. That build belongs to the publish job.
 
 ### Artifact release
 
 The installable binary is produced by the `publish` job of
 `.github/workflows/ci-required.yml` on every push to `main`, after
 `ci-required` is green. The job runs `.lastgit/artifact-release.sh` on a macOS
-runner (`cargo build --locked --release --features neural`), then packs
-`dist/lastseek`, `LICENSE` and `THIRD_PARTY_NOTICES` into the Actions artifact
-`ht-artifact-<commit sha>`. `host-track refresh lastseek` pulls and verifies it
-on the Mac. The build fetches the ONNX Runtime binaries but never model
-weights: the weights are host state. The required `ci-required` gate never
-invokes the slow build.
+runner (`cargo build --locked --release --features neural`) through the
+last-stack registry package workflow. The package is described by
+`.last-stack/package.json` and contains `dist/lastseek`, `lastseek.app.json`,
+`LICENSE`, and `THIRD_PARTY_NOTICES`. The app registry installs that package
+and links `~/.local/bin/lastseek` at `dist/lastseek`. The build fetches the
+ONNX Runtime binaries but never model weights: the weights are host state.
+The required `ci-required` gate never invokes the slow build.

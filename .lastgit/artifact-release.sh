@@ -5,8 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-# LastGit runs under launchd, whose minimal PATH does not include rustup's
-# user-local toolchain by default.
+# The macOS publish runner does not put rustup's user-local toolchain on PATH.
 export PATH="${CARGO_HOME:-$HOME/.cargo}/bin:$PATH"
 command -v cargo >/dev/null
 
@@ -37,8 +36,8 @@ test -x "$built" || {
   exit 1
 }
 
-# `dist/` is what artifacts.json publishes, and it is always repo-relative
-# regardless of where cargo built.
+# `dist/` is what .last-stack/package.json publishes, and it is always
+# repo-relative regardless of where cargo built.
 mkdir -p dist
 install -m 0755 "$built" dist/lastseek
 test -x dist/lastseek
@@ -58,9 +57,9 @@ if [ "$shipped_version" != "$cargo_version" ]; then
 fi
 
 # The public binary is Apache-2.0 and statically links third-party code, so
-# the license and the third-party notices travel with it. artifacts.json
-# publishes them from the tree root, next to dist/ (not inside it), so the
-# dist/lastseek path that Host Track links stays unchanged.
+# the license and the third-party notices travel with it. The registry
+# package lists them at the tree root, next to dist/ (not inside it). The
+# installed command is the registry link to dist/lastseek.
 for f in LICENSE THIRD_PARTY_NOTICES; do
   test -s "$f" || {
     echo "release artifact file $f is missing or empty" >&2

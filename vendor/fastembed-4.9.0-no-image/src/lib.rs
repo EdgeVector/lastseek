@@ -59,8 +59,6 @@
 #![allow(mismatched_lifetime_syntaxes)]
 
 mod common;
-#[cfg(feature = "image-models")]
-mod image_embedding;
 mod models;
 pub mod output;
 mod pooling;
@@ -90,14 +88,6 @@ pub use crate::models::sparse::SparseModel;
 pub use crate::sparse_text_embedding::{
     SparseInitOptions, SparseTextEmbedding, UserDefinedSparseModel,
 };
-
-// For Image Embedding (gated: the `image` crate and its codec tree only
-// compile when a consumer opts into image embeddings)
-#[cfg(feature = "image-models")]
-pub use crate::image_embedding::{
-    ImageEmbedding, ImageInitOptions, ImageInitOptionsUserDefined, UserDefinedImageEmbeddingModel,
-};
-pub use crate::models::image_embedding::ImageEmbeddingModel;
 
 // For Reranking
 pub use crate::models::reranking::RerankerModel;

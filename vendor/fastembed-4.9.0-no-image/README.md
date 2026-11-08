@@ -47,13 +47,7 @@
 
 - [**prithivida/Splade_PP_en_v1**](https://huggingface.co/prithivida/Splade_PP_en_v1) - Default
 
-### Image Embedding
-
-- [**Qdrant/clip-ViT-B-32-vision**](https://huggingface.co/Qdrant/clip-ViT-B-32-vision) - Default
-- [**Qdrant/resnet50-onnx**](https://huggingface.co/Qdrant/resnet50-onnx)
-- [**Qdrant/Unicom-ViT-B-16**](https://huggingface.co/Qdrant/Unicom-ViT-B-16)
-- [**Qdrant/Unicom-ViT-B-32**](https://huggingface.co/Qdrant/Unicom-ViT-B-32)
-- [**nomic-ai/nomic-embed-vision-v1.5**](https://huggingface.co/nomic-ai/nomic-embed-vision-v1.5)
+This vendored fork keeps text embeddings only.
 
 ### Reranking
 
@@ -106,28 +100,6 @@ let documents = vec![
  println!("Embeddings length: {}", embeddings.len()); // -> Embeddings length: 4
  println!("Embedding dimension: {}", embeddings[0].len()); // -> Embedding dimension: 384
 
-```
-
-### Image Embeddings
-
-```rust
-use fastembed::{ImageEmbedding, ImageInitOptions, ImageEmbeddingModel};
-
-// With default InitOptions
-let model = ImageEmbedding::try_new(Default::default())?;
-
-// With custom InitOptions
-let model = ImageEmbedding::try_new(
-    ImageInitOptions::new(ImageEmbeddingModel::ClipVitB32).with_show_download_progress(true),
-)?;
-
-let images = vec!["assets/image_0.png", "assets/image_1.png"];
-
-// Generate embeddings with the default batch size, 256
-let embeddings = model.embed(images, None)?;
-
-println!("Embeddings length: {}", embeddings.len()); // -> Embeddings length: 2
-println!("Embedding dimension: {}", embeddings[0].len()); // -> Embedding dimension: 512
 ```
 
 ### Candidates Reranking

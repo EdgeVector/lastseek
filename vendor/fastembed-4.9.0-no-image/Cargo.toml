@@ -25,7 +25,6 @@ homepage = "https://crates.io/crates/fastembed"
 [dependencies]
 anyhow = { version = "1" }
 hf-hub = { version = "0.4.1", default-features = false, optional = true }
-image = { version = "0.25.2", optional = true }
 ndarray = { version = "0.16", default-features = false }
 ort = { version = "=2.0.0-rc.9", default-features = false, features = [
   "ndarray",
@@ -36,11 +35,6 @@ tokenizers = { version = "0.21", default-features = false, features = ["onig"] }
 
 [features]
 default = ["ort-download-binaries", "hf-hub-native-tls"]
-
-# Vendored fold patch (schema-lambda-fastembed-image-cut): image embeddings
-# are opt-in so text-only consumers (the schema Lambda) do not compile the
-# image codec tree. Upstream fastembed gained the same gate in v5.4.0.
-image-models = ["dep:image"]
 
 hf-hub = ["dep:hf-hub", "hf-hub?/ureq"]
 hf-hub-native-tls = ["hf-hub", "hf-hub?/native-tls"]

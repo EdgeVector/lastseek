@@ -9,7 +9,7 @@ license = "Apache-2.0"
 # Without this, Cargo's implicit workspace would pull the vendored fastembed
 # fork in as a member, so `cargo fmt --all` / `cargo clippy --all-targets
 # --all-features -D warnings` would reformat and lint unmodified upstream
-# code. Same exclusion fold uses for the same fork.
+# code. The fork stays outside this workspace.
 [workspace]
 exclude = ["vendor/fastembed-4.9.0-no-image"]
 
@@ -21,7 +21,7 @@ thiserror = "2"
 fs2 = "0.4"
 # Neural embedding is opt-in (see `neural` feature below) so a default build
 # links no inference runtime and downloads no model weights. Vendored at
-# vendor/fastembed-4.9.0-no-image (same fork fold uses) so the pinned `ort`
+# vendor/fastembed-4.9.0-no-image so the pinned `ort`
 # version it carries never collides with a second direct `ort` dependency in
 # this crate's own graph. default-features = false + hf-hub left off: model
 # bytes are read from disk ourselves (see BgeSmallEmbedder::load), never
@@ -34,7 +34,7 @@ fastembed = { path = "vendor/fastembed-4.9.0-no-image", optional = true, default
 # floats up to a newer ort-sys (2.0.0-rc.13 as of 2026-08). That newer
 # ort-sys build script requires a TLS feature rc.9's `ort` manifest has no
 # way to request, so `download-binaries` fails to compile. Pinning ort-sys
-# here too keeps the pair at the matching version fold's own lockfile uses.
+# here too keeps the pair at the matching ort-sys version.
 ort-sys = { version = "=2.0.0-rc.9", optional = true, default-features = false }
 
 [features]
