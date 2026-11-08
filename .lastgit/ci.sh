@@ -69,11 +69,7 @@ fi
 #      Rust CR in this repo would have died the same way.
 #
 # Keep `neural` out of the required gate. The tests are deleted (2026-10-09), so
-# the gate runs fmt, clippy and a build.
-#
-# `fault-injection` stays in the gate: it is pure Rust and costs nothing, so
-# clippy keeps linting the feature code.
-FEATURES=fault-injection
+# the gate runs fmt, clippy and a build with default features.
 
 # Guard the reason above against a well-meaning re-broadening.
 if grep -qE '^[[:space:]]*cargo (clippy|build).*--all-features' .lastgit/ci.sh; then
@@ -82,7 +78,7 @@ if grep -qE '^[[:space:]]*cargo (clippy|build).*--all-features' .lastgit/ci.sh; 
 fi
 
 cargo fmt --all -- --check
-cargo clippy --lib --bins --features "$FEATURES" -- -D warnings
-cargo build --features "$FEATURES"
+cargo clippy --lib --bins -- -D warnings
+cargo build
 
 echo "lastgit ci gate PASSED"

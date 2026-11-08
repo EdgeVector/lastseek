@@ -64,7 +64,6 @@ lastseek status [--home DIR] [--table PATH] [--coverage]
                     WITH row counts, which is expensive — opt-in on purpose.
   --coverage-floor F  minimum vectors/source ratio for healthy (default 0.95)
   --source-counts PATH  declared live-record counts
-  --catalog PATH|URL    catalog fixture instead of the live socket
   --lastdb-socket PATH  LastDB Unix socket
 
 Reports `freshness_lag_ms` — how far behind the node the applied corpus is,
@@ -75,7 +74,6 @@ costs a directory listing.
             "--table",
             "--coverage-floor",
             "--source-counts",
-            "--catalog",
             "--lastdb-socket",
             "--inbox",
         ],
@@ -93,7 +91,6 @@ Currently an alias for `status`. Same flags.
             "--table",
             "--coverage-floor",
             "--source-counts",
-            "--catalog",
             "--lastdb-socket",
             "--inbox",
         ],

@@ -6,7 +6,7 @@
 //! backlog grew to 99k unnoticed.
 
 use lastseek::coverage::{CoverageReport, DEFAULT_COVERAGE_FLOOR};
-use lastseek::embed::{DeterministicEmbedder, Embedder};
+use lastseek::embed::Embedder;
 use lastseek::index::{QueryOpts, Searcher};
 use lastseek::ingest::Watermark;
 use lastseek::metrics::{self, LastDrain, QUERY_TIMEOUT_MS};
@@ -40,8 +40,6 @@ usage:
   --home DIR   store directory (default: $LASTSEEK_HOME or ~/.lastseek/index)
   --table PATH resolution table (default: $LASTSEEK_SCHEMA_TABLE or
                ~/.lastseek/schema-table.json)
-  --catalog PATH|URL
-               LastDB schema catalog fixture/URL (default: live Unix socket)
   --lastdb-socket PATH
                LastDB Unix socket (default: $LASTSEEK_LASTDB_SOCKET,
                $LASTDB_SOCKET, or $LASTDB_HOME/data/folddb.sock)
@@ -70,8 +68,7 @@ without being told. Only a fresh, unbound store needs telling. `bge` loads
 bge-small-en-v1.5 from $LASTSEEK_MODEL_DIR, else
 ~/.lastseek/models/bge-small-en-v1.5, else the install's
 share/lastseek/models/bge-small-en-v1.5 (the Homebrew formula puts it there),
-and requires a build with `--features neural`; `deterministic` is a TEST FIXTURE with no semantics and is
-refused for production stores.
+and requires a build with `--features neural`.
 ";
 
 fn home(args: &[String]) -> std::path::PathBuf {
@@ -214,39 +211,11 @@ fn lastdb_socket(args: &[String]) -> std::path::PathBuf {
         .join("folddb.sock")
 }
 
-/// Read source record counts from LastDB.
+/// Read source record counts from LastDB over the Unix socket.
 ///
-/// This is the status half of LastSeek's existing LastDB relationship, not a
-/// third integration: ingest reads LastDB changes and status reads the node's
-/// catalog. The Unix socket remains the default; retired TCP is never probed.
+/// Ingest reads LastDB changes and status reads the node's catalog at
+/// `/api/schemas?include_counts=true`.
 fn fetch_lastdb_catalog(args: &[String]) -> Result<(Vec<u8>, String), LastSeekError> {
-    if let Some(src) =
-        flag_value(args, "--catalog").or_else(|| std::env::var("LASTSEEK_LASTDB_CATALOG").ok())
-    {
-        if !(src.starts_with("http://") || src.starts_with("https://")) {
-            return Ok((std::fs::read(&src)?, src));
-        }
-        let out = std::process::Command::new("curl")
-            .args([
-                "-sS",
-                "--fail",
-                "-m",
-                "180",
-                "-H",
-                "X-LastDB-Client: lastseek",
-                &src,
-            ])
-            .output()?;
-        if out.status.success() {
-            return Ok((out.stdout, src));
-        }
-        return Err(LastSeekError::Embedder(format!(
-            "fetching LastDB catalog {src}: curl exited {:?}: {}",
-            out.status.code(),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )));
-    }
-
     let socket = lastdb_socket(args);
     let socket_text = socket.to_string_lossy().to_string();
     let url = "http://localhost/api/schemas?include_counts=true";
@@ -301,7 +270,6 @@ fn flag_values(args: &[String], name: &str) -> Vec<String> {
 fn selector_for_embedder_id(id: &str) -> Option<&'static str> {
     match id {
         "fastembed/bge-small-en-v1.5" => Some("bge"),
-        "deterministic-test-fixture" => Some("deterministic"),
         _ => None,
     }
 }
@@ -332,7 +300,7 @@ fn embedder_for(store_embedder_id: &str) -> Result<Box<dyn Embedder>, LastSeekEr
         None => selector_for_embedder_id(store_embedder_id).ok_or_else(|| {
             LastSeekError::Embedder(if store_embedder_id.is_empty() {
                 "this store has no embedder bound yet, so there is nothing to infer: set \
-                 LASTSEEK_EMBEDDER=bge for neural embedding or =deterministic for fixtures"
+                 LASTSEEK_EMBEDDER=bge for neural embedding"
                     .to_string()
             } else {
                 format!(
@@ -344,7 +312,6 @@ fn embedder_for(store_embedder_id: &str) -> Result<Box<dyn Embedder>, LastSeekEr
     };
 
     match selector {
-        "deterministic" => Ok(Box::new(DeterministicEmbedder::new(384))),
         #[cfg(feature = "neural")]
         "bge" => {
             let dir = lastseek::embed::BgeSmallEmbedder::default_model_dir();
@@ -355,8 +322,7 @@ fn embedder_for(store_embedder_id: &str) -> Result<Box<dyn Embedder>, LastSeekEr
             "bge requires a build with --features neural".into(),
         )),
         other => Err(LastSeekError::Embedder(format!(
-            "unknown embedder {other:?}; set LASTSEEK_EMBEDDER=deterministic for fixtures \
-             or LASTSEEK_EMBEDDER=bge for neural embedding"
+            "unknown embedder {other:?}; set LASTSEEK_EMBEDDER=bge for neural embedding"
         ))),
     }
 }
