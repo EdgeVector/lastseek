@@ -21,6 +21,14 @@
           "scripts/registry-prepare.py"
         ],
         "timeout_s": 600
+      },
+      {
+        "argv": [
+          "bash",
+          "scripts/registry-models.sh",
+          "--fetch"
+        ],
+        "timeout_s": 600
       }
     ],
     "probe": [

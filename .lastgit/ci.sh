@@ -22,21 +22,20 @@ test ! -d vendor/laststore
 
 bash -n .lastgit/ci.sh
 bash -n .lastgit/artifact-release.sh
+bash -n scripts/registry-models.sh
+python3 -m py_compile scripts/registry-prepare.py scripts/registry-package.py scripts/ci-fresh-install.py
 
-# The feature-complete binary is built only by the separate `publish` job of
-# ci-required.yml (macOS runner, last-stack registry-app-package). That job
-# reads .last-stack/package.json. A context key would drop the entry, so this
-# gate proves the one darwin-arm64 package is present and has no context.
+# The feature-complete binary is built only by the separate `package` job of
+# ci-required.yml. scripts/registry-package.py packs it, and the install plan
+# must still fetch the package and the model before its probes run.
 jq -e '
-  [.artifacts[]
-    | select(
-        .app == "lastseek"
-        and .platform == "darwin-arm64"
-        and (has("context") | not)
-        and .paths == ["dist/lastseek", "lastseek.app.json", "LICENSE", "THIRD_PARTY_NOTICES"]
-      )]
-  | length == 1
-' .last-stack/package.json >/dev/null
+  .install.prepare == [
+    {"argv": ["python3", "scripts/registry-prepare.py"], "timeout_s": 600},
+    {"argv": ["bash", "scripts/registry-models.sh", "--fetch"], "timeout_s": 600}
+  ]
+  and .install.post_install == []
+  and (.install.links == [{"source": "dist/lastseek", "command": "lastseek"}])
+' lastdb-app.json >/dev/null
 
 # Public Homebrew binaries are Apache-2.0 (decision 2026-09-23). The license
 # files the release artifact carries must exist and agree with Cargo.toml.
@@ -61,7 +60,7 @@ fi
 #      no inference runtime and fetches no weights. --all-features contradicted
 #      the thing it was supposed to protect.
 #   2. It is slow. Compiling ort and the vendored fastembed graph in release
-#      takes about 11.5 minutes. That work belongs to the publish job, not
+#      takes about 11.5 minutes. That work belongs to the package job, not
 #      the required gate.
 #
 # Keep `neural` out of the required gate. The tests are deleted (2026-10-09), so

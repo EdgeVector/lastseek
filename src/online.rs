@@ -16,8 +16,10 @@ use crate::LastSeekError;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::OsStr;
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const ONLINE: &str = ".lastseek-online";
@@ -25,6 +27,14 @@ const ACTIVE: &str = "active";
 const STATE: &str = "checkpoint.json";
 const COMPACT_AT: usize = 4096;
 const REBUILD_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// Change events one query may replay before it answers. A query runs under
+/// its caller's deadline (Brain stops a spawn at 10 s), so the bound is one
+/// that embeds well inside it. A scheduled `drain` has no such limit.
+const QUERY_CATCH_UP_EVENTS: usize = 256;
+/// How long the first query waits for the index it started. A small Brain
+/// publishes inside this; a large one keeps building after the query returns.
+const FIRST_BUILD_WAIT: Duration = Duration::from_secs(4);
+const BACKGROUND_LOG: &str = "background.log";
 
 #[derive(Clone, Serialize, Deserialize)]
 pub struct Checkpoint {
@@ -78,6 +88,11 @@ impl Checkpoint {
             "gap_rebuilds": self.recovery.gap_rebuilds,
             "blocked_by": self.recovery.blocked_by,
         })
+    }
+
+    /// A feed gap is repaired without review. A schema change is not.
+    pub fn feed_gap(&self) -> bool {
+        self.needs_rebuild && self.recovery.blocked_by.unwrap_or(Block::FeedGap) == Block::FeedGap
     }
 
     pub fn require_ready(&self) -> Result<(), LastSeekError> {
@@ -137,6 +152,142 @@ fn lock(root: &Path, name: &str, exclusive: bool) -> Result<File, LastSeekError>
 
 pub fn lock_updates(root: &Path) -> Result<File, LastSeekError> {
     lock(root, "updates.lock", true)
+}
+
+/// Take a control lock only when no other process holds it.
+fn try_lock(root: &Path, name: &str) -> Result<Option<File>, LastSeekError> {
+    let control = root.join(ONLINE);
+    create_private_dir_all(&control)?;
+    let lock = private_open_options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(control.join(name))?;
+    match fs2::FileExt::try_lock_exclusive(&lock) {
+        Ok(()) => Ok(Some(lock)),
+        Err(error) if error.kind() == fs2::lock_contended_error().kind() => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The store root that owns a published online index directory.
+pub fn root_of(dir: &Path) -> Result<&Path, LastSeekError> {
+    dir.parent()
+        .and_then(Path::parent)
+        .ok_or_else(|| invalid("online index directory has no store root"))
+}
+
+/// True when `root` holds no index: no published online index, and a plain
+/// store that no `add` or `drain` ever bound to an embedder.
+pub fn unbuilt(root: &Path) -> Result<bool, LastSeekError> {
+    Ok(active(root)?.is_none() && VectorStore::open(root)?.embedder_id().is_empty())
+}
+
+/// Run `lastseek <args> --home ROOT` outside this process, so the work
+/// finishes when the caller that started it reaches its deadline.
+fn spawn_background(root: &Path, args: &[&OsStr]) -> Result<Child, LastSeekError> {
+    let control = root.join(ONLINE);
+    create_private_dir_all(&control)?;
+    let log = private_open_options()
+        .create(true)
+        .truncate(true)
+        .write(true)
+        .open(control.join(BACKGROUND_LOG))?;
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args(args)
+        .arg("--home")
+        .arg(root)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(log);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+    Ok(command.spawn()?)
+}
+
+/// Build the first index for a store that has none, from the query that
+/// needed it. The build runs in its own process: a small Brain is searchable
+/// before this returns, and a large one is not held to the caller's deadline.
+pub fn first_build(root: &Path, socket: &Path) -> Result<(), LastSeekError> {
+    let mut child = match try_lock(root, "rebuild.lock")? {
+        // Release the probe lock before the builder asks for it.
+        Some(probe) => {
+            drop(probe);
+            Some(spawn_background(
+                root,
+                &[
+                    OsStr::new("rebuild"),
+                    OsStr::new("--if-absent"),
+                    OsStr::new("--lastdb-socket"),
+                    socket.as_os_str(),
+                ],
+            )?)
+        }
+        None => None,
+    };
+    let started = Instant::now();
+    loop {
+        std::thread::sleep(Duration::from_millis(100));
+        if active(root)?.is_some() {
+            return Ok(());
+        }
+        let finished = match child.as_mut() {
+            Some(child) => child.try_wait()?.is_some(),
+            None => try_lock(root, "rebuild.lock")?.is_some(),
+        };
+        if finished {
+            if active(root)?.is_some() {
+                return Ok(());
+            }
+            return Err(invalid(format!(
+                "the first index build did not finish; run `lastseek rebuild` to see why (log: {})",
+                root.join(ONLINE).join(BACKGROUND_LOG).display()
+            )));
+        }
+        if started.elapsed() >= FIRST_BUILD_WAIT {
+            return Err(invalid(
+                "the first index build is still running; search uses it once it is published",
+            ));
+        }
+    }
+}
+
+/// Start the online drain that rebuilds after a feed gap, unless an update
+/// already holds the store.
+pub fn recover_in_background(root: &Path) -> Result<(), LastSeekError> {
+    if let Some(probe) = try_lock(root, "updates.lock")? {
+        drop(probe);
+        spawn_background(
+            root,
+            &[
+                OsStr::new("drain"),
+                OsStr::new("--max-files"),
+                OsStr::new("500"),
+            ],
+        )?;
+    }
+    Ok(())
+}
+
+/// Bring a published index up to the feed head before a query reads it.
+/// Returns `None` when another process is already updating the store.
+pub fn catch_up(
+    dir: &Path,
+    table: &SchemaTable,
+    embedder: &mut dyn Embedder,
+) -> Result<Option<Value>, LastSeekError> {
+    let Some(_updates) = try_lock(root_of(dir)?, "updates.lock")? else {
+        return Ok(None);
+    };
+    // Read the checkpoint under the lock: a drain may have moved it since
+    // this query selected the index.
+    let checkpoint: Checkpoint = serde_json::from_slice(&fs::read(dir.join(STATE))?)?;
+    drain(dir, checkpoint, table, embedder, QUERY_CATCH_UP_EVENTS).map(Some)
 }
 
 fn active(root: &Path) -> Result<Option<&'static str>, LastSeekError> {
@@ -327,8 +478,16 @@ pub fn rebuild(
     names: &[String],
     table: &SchemaTable,
     embedder: &mut dyn Embedder,
+    if_absent: bool,
 ) -> Result<Value, LastSeekError> {
     let _rebuild = lock(root, "rebuild.lock", true)?;
+    // Two first queries can each start a build. The second one finds the
+    // index the first one published and leaves it alone.
+    if if_absent && active(root)?.is_some() {
+        return Ok(
+            json!({"ok":true, "source":"lastdb-change-feed", "skipped":"an index is already published"}),
+        );
+    }
     let recovery = select(root)?
         .checkpoint
         .map(|state| state.recovery)

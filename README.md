@@ -1,5 +1,35 @@
 # LastSeek
 
+## Install
+
+```sh
+lastdb app install lastseek
+```
+
+That is the whole setup. The install downloads the binary that CI built from
+the listed commit (a public GitHub Release asset, checked against its
+provenance record) and the five bge-small-en-v1.5 model files (one pinned
+revision, each checked against a pinned SHA-256, about 134 MB, kept under
+`~/.lastseek/models`). It needs `curl`, `git` and `python3`, and no GitHub
+login. A platform with no package builds from the locked source and needs the
+Rust toolchain.
+
+Brain uses LastSeek when the `lastseek` command is on `PATH`. The first
+`brain search` builds the index from the running LastDB, in a separate process:
+a small Brain is searchable before that search returns, and a large one a
+little later, while Brain answers from its keyword search. After that, every
+query first replays the LastDB change feed (at most 256 events), so a record
+written a moment ago is found by the next search. No timer, LaunchAgent or
+service is installed. A feed gap after a LastDB restart starts a rebuild in the
+same way. A changed searchable schema still needs an explicit
+`lastseek rebuild`.
+
+A host that schedules `lastseek drain` itself can set `LASTSEEK_QUERY_SYNC=0`
+to keep queries read-only. The scheduled drain and the query replay take the
+same lock, so both can run.
+
+## Rebuild by hand
+
 For local Brain records, rebuild the index while LastDB is running:
 
 ```sh
@@ -337,19 +367,13 @@ third-party code is listed in `THIRD_PARTY_NOTICES`. The source is public under 
 
 ### Fetching the bge-small-en-v1.5 weights
 
-Neither the weights nor a fetch step ship in this repo, and CI never fetches
-them. To use `LASTSEEK_EMBEDDER=bge` locally, download the five files FastEmbed
-itself would pull from `Xenova/bge-small-en-v1.5` into
-`~/.lastseek/models/bge-small-en-v1.5` (or `$LASTSEEK_MODEL_DIR`):
+The weights are not in this repo and the required CI gate never fetches them.
+The app registry install downloads them for you. To fetch them by hand into
+`~/.lastseek/models/bge-small-en-v1.5` (or `$LASTSEEK_MODEL_DIR`), with the same
+pinned revision and SHA-256 checks:
 
 ```bash
-dir="${LASTSEEK_MODEL_DIR:-$HOME/.lastseek/models/bge-small-en-v1.5}"
-mkdir -p "$dir"
-base="https://huggingface.co/Xenova/bge-small-en-v1.5/resolve/main"
-curl -L "$base/onnx/model.onnx" -o "$dir/model.onnx"
-for f in tokenizer.json config.json special_tokens_map.json tokenizer_config.json; do
-  curl -L "$base/$f" -o "$dir/$f"
-done
+bash scripts/registry-models.sh --fetch
 ```
 
 ## Usage
@@ -384,13 +408,22 @@ minutes in release. That build belongs to the publish job.
 
 ### Artifact release
 
-The installable binary is produced by the `publish` job of
-`.github/workflows/ci-required.yml` on every push to `main`, after
-`ci-required` is green. The job runs `.lastgit/artifact-release.sh` on a macOS
-runner (`cargo build --locked --release --features neural`) through the
-last-stack registry package workflow. The package is described by
-`.last-stack/package.json` and contains `dist/lastseek`, `lastseek.app.json`,
-`LICENSE`, and `THIRD_PARTY_NOTICES`. The app registry installs that package
-and links `~/.local/bin/lastseek` at `dist/lastseek`. The build fetches the
-ONNX Runtime binaries but never model weights: the weights are host state.
-The required `ci-required` gate never invokes the slow build.
+The installable binary is produced by the `package` job of
+`.github/workflows/ci-required.yml`, for `darwin-arm64` and `linux-x86_64`. The
+job runs `.lastgit/artifact-release.sh` (`cargo build --locked --release
+--features neural`) and `scripts/registry-package.py`. The package contains
+`dist/lastseek`, `lastseek.app.json`, `LICENSE`, and `THIRD_PARTY_NOTICES`, with
+a provenance record that names the commit, the tree and each file's SHA-256.
+The build fetches the ONNX Runtime binaries but never model weights.
+
+The `fresh-install` job then runs the new-user path with that package
+(`scripts/ci-fresh-install.py`): the stable LastDB release, a generated home,
+Brain from the stable channel, LastSeek's own install plan, and a Brain search
+that LastSeek must answer, first for existing records and then for a record
+written after the index was built. On a push to `main` the `release` job
+publishes the proved packages as GitHub Release assets under `app-<commit>`.
+`scripts/registry-prepare.py` downloads them from there on an install and
+links `~/.local/bin/lastseek` at `dist/lastseek`. Dispatch the workflow with
+`registry_channel` set to run the real `lastdb app install lastseek` from the
+public registry in a fresh home. The required `ci-required` gate never invokes
+the slow build.
