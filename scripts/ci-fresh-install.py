@@ -216,6 +216,26 @@ class Run:
                   f"no LastSeek timer or service exists (applied through {status.get('applied_through')}, "
                   f"recovery {json.dumps(status.get('online_recovery'))})")
 
+    def diagnose(self):
+        """Print what a failed search left behind. The data is generated, so it can be shown."""
+        log = self.home / ".lastseek/index/.lastseek-online/background.log"
+        probes = (
+            ("lastseek query", ["lastseek", "query", FIRST_QUERY, "--k", "3", "--schema", "brain/Concept"]),
+            ("lastseek rebuild", ["lastseek", "rebuild"]),
+            ("lastseek status", ["lastseek", "status"]),
+            ("brain search", ["brain", "search", FIRST_QUERY, "--json"]),
+        )
+        for name, argv in probes:
+            result = self.call(argv, check=False, timeout=300)
+            print(f"-- {name}: exit {result.returncode}\n{result.stdout[-1500:]}\n{result.stderr[-1500:]}", flush=True)
+        if log.is_file():
+            print(f"-- background build log\n{log.read_text()[-1500:]}", flush=True)
+        catalog = self.socket("/api/schemas?include_full=true")
+        for schema in catalog.get("schemas", []):
+            print("-- schema", json.dumps({key: schema.get(key) for key in (
+                "name", "owner_app_id", "state", "schema_type", "identity_hash", "field_classifications")})[:400],
+                flush=True)
+
     def stop(self):
         if self.daemon and self.daemon.poll() is None:
             self.daemon.terminate()
@@ -253,6 +273,11 @@ def main():
         run.search()
     except Exception as error:  # the summary must record a failed run too
         failure = error
+        try:
+            if run.daemon and run.daemon.poll() is None and (run.home / ".local/bin/lastseek").exists():
+                run.diagnose()
+        except Exception as secondary:
+            print(f"diagnosis stopped: {secondary}", flush=True)
         log = args.work / "lastdbd.log"
         if log.is_file():
             print(log.read_text()[-3000:], flush=True)
