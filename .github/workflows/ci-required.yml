@@ -1,8 +1,12 @@
-# Merge gate and artifact publish for lastseek. Gate of record: GitHub (2026-09-30).
+# Merge gate, install proof and package release for lastseek. Gate of record: GitHub (2026-09-30).
 # `check` runs .lastgit/ci.sh: fmt, clippy and a build with default features
-# (no `neural`: no ONNX Runtime download, no model weights in CI). `ci-required`
-# is the one required check. `publish` runs only on a push to main, after
-# ci-required, and builds the feature-complete darwin-arm64 binary on a macOS runner.
+# (no `neural`: no ONNX Runtime download, no model weights). `ci-required`
+# is the one required check.
+# `package` builds the feature-complete binary for each platform. `fresh-install`
+# then runs the new-user path with that package: stable LastDB, a generated home,
+# Brain, LastSeek's own install plan, and a Brain search that LastSeek answers.
+# `release` runs only on a push to main and publishes the proved packages as
+# public GitHub Release assets under `app-<commit>`, where an install finds them.
 name: ci-required
 
 on:
@@ -11,6 +15,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      registry_channel:
+        description: Also run `lastdb app install lastseek` from this public registry channel in a fresh home
+        type: choice
+        options: [none, next, stable]
+        default: none
 
 permissions:
   contents: read
@@ -43,16 +53,116 @@ jobs:
           echo "check=$CHECK_RESULT"
           test "$CHECK_RESULT" = "success"
 
-  publish:
-    name: publish
-    needs: [ci-required]
-    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
-    permissions:
-      contents: read
-    uses: EdgeVector/last-stack/.github/workflows/registry-app-package.yml@main
-    with:
-      runs-on: macos-latest
+  package:
+    name: package (${{ matrix.platform }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: darwin-arm64, runner: macos-15 }
+          - { platform: linux-x86_64, runner: ubuntu-24.04 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: neural-${{ matrix.platform }}
       # cargo build --features neural (downloads ONNX Runtime binaries, never model
-      # weights), then the release script's own smoke checks (--help, --version).
-      build-command: "bash .lastgit/artifact-release.sh"
-      config: .last-stack/package.json
+      # weights), then the release script's own checks (--help, --version).
+      - name: Build the feature-complete binary
+        run: bash .lastgit/artifact-release.sh
+      - name: Pack the binary and its provenance record
+        run: python3 scripts/registry-package.py --platform '${{ matrix.platform }}' --out "$RUNNER_TEMP/package"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lastseek-${{ matrix.platform }}-${{ github.sha }}
+          path: ${{ runner.temp }}/package/
+          if-no-files-found: error
+          retention-days: 14
+
+  fresh-install:
+    name: fresh install (${{ matrix.platform }})
+    needs: [package]
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: darwin-arm64, runner: macos-15 }
+          - { platform: linux-x86_64, runner: ubuntu-24.04 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Brain's install plan runs `bun install`.
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.2'
+      - uses: actions/download-artifact@v4
+        with:
+          name: lastseek-${{ matrix.platform }}-${{ github.sha }}
+          path: ${{ runner.temp }}/package
+      - name: Install and search as a new user, on generated data
+        run: >-
+          python3 scripts/ci-fresh-install.py --work "$RUNNER_TEMP/fresh-install"
+          --mode package --package-dir "$RUNNER_TEMP/package"
+
+  release:
+    name: release
+    needs: [ci-required, package, fresh-install]
+    if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: lastseek-*-${{ github.sha }}
+          path: ${{ runner.temp }}/release
+          merge-multiple: true
+      - name: Publish the proved packages for this commit
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          tag="app-$GITHUB_SHA"
+          cd "$RUNNER_TEMP/release"
+          sha256sum lastseek-*.tar.gz lastseek-*.provenance.json | tee SHA256SUMS.txt
+          if gh release view "$tag" >/dev/null 2>&1; then
+            gh release upload "$tag" lastseek-* SHA256SUMS.txt --clobber
+          else
+            gh release create "$tag" lastseek-* SHA256SUMS.txt --target "$GITHUB_SHA" --latest=false \
+              --title "LastSeek package for $GITHUB_SHA" \
+              --notes "Built and proved by $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID. The app registry install of this commit downloads these files and checks them against the provenance record."
+          fi
+          {
+            echo "### Released $tag"
+            echo
+            echo '```'
+            cat SHA256SUMS.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  registry-install:
+    name: registry install (${{ inputs.registry_channel }})
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.registry_channel != 'none' }}
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: '1.3.2'
+      - name: Install LastSeek from the public registry as a new user
+        run: >-
+          python3 scripts/ci-fresh-install.py --work "$RUNNER_TEMP/fresh-install"
+          --mode registry --channel '${{ inputs.registry_channel }}'

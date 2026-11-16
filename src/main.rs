@@ -27,6 +27,7 @@ usage:
   lastseek add [--home DIR]           read Records as JSONL on stdin, embed, append
   lastseek compact [--home DIR]       fold the pending log into the slab
   lastseek rebuild [--home DIR]       rebuild local Brain search from live LastDB
+                                      (the first query does this by itself)
   lastseek drain [--home DIR] [--inbox DIR] [--max-files N] [--consume]
                                       apply the host's IndexChangeBatch feed
   lastseek doctor [--home DIR]
@@ -61,6 +62,12 @@ deletes them.
 registry name, and is resolved through the Schema Service table. A schema name
 that resolves to nothing is an ERROR, not an empty result — those are different
 answers and callers depend on telling them apart.
+
+`query` keeps its own index current. With no index, the first query builds one
+from live LastDB in a separate process and answers when it is published. With
+an online index, each query first replays the LastDB change feed (bounded), so
+a record written a moment ago is found. No timer or service is needed.
+LASTSEEK_QUERY_SYNC=0 turns both off for a host that schedules `drain` itself.
 
 A store names its own embedder, so LASTSEEK_EMBEDDER is an OVERRIDE, not a
 requirement: querying a store built with bge-small-en-v1.5 loads that model
@@ -117,6 +124,14 @@ fn brain_query_index(
         .as_ref()
         .is_some_and(|state| state.covers(&schemas))
         .then_some(selected))
+}
+
+/// Whether `query` builds and updates the index it reads. On by default: a
+/// fresh install has no timer, and an index that answers while stale is the
+/// failure this store has had before. A host that schedules `drain` itself can
+/// set `LASTSEEK_QUERY_SYNC=0` to keep queries read-only.
+fn query_sync() -> bool {
+    !matches!(std::env::var("LASTSEEK_QUERY_SYNC").as_deref(), Ok("0"))
 }
 
 /// Parse a flag's value as `T`, erroring on a present-but-malformed value
@@ -377,6 +392,7 @@ fn run() -> Result<(), LastSeekError> {
             &flag_values(&args, "--schema"),
             &table,
             embedder.as_mut(),
+            args.iter().any(|a| a == "--if-absent"),
         )?;
         println!("{}", serde_json::to_string_pretty(&result)?);
         return Ok(());
@@ -384,6 +400,16 @@ fn run() -> Result<(), LastSeekError> {
     let _updates = matches!(cmd.as_str(), "drain" | "compact" | "add")
         .then(|| lastseek::online::lock_updates(&root))
         .transpose()?;
+    // A store with no index gets one from the first query that needs it.
+    // An explicit --inbox names the file feed, which has its own drain.
+    if cmd == "query"
+        && query_sync()
+        && flag_value(&args, "--inbox").is_none()
+        && lastseek::online::unbuilt(&root)?
+        && brain_query_index(&args, &root)?.is_none()
+    {
+        lastseek::online::first_build(&root, &std::path::absolute(lastdb_socket(&args))?)?;
+    }
     let selection = if cmd == "query" {
         match brain_query_index(&args, &root)? {
             Some(selected) => Some(selected),
@@ -410,6 +436,11 @@ fn run() -> Result<(), LastSeekError> {
             ));
         }
         if cmd == "query" {
+            // A feed gap needs a rebuild and no review. Start it here, so an
+            // install with no scheduled drain repairs itself.
+            if checkpoint.feed_gap() && query_sync() {
+                lastseek::online::recover_in_background(lastseek::online::root_of(&dir)?)?;
+            }
             checkpoint.require_ready()?;
         }
     } else {
@@ -717,12 +748,25 @@ fn run() -> Result<(), LastSeekError> {
                         .into(),
                 ));
             }
-            let store = VectorStore::open(&dir)?;
             let mut table = load_schema_table(&args);
+            let mut emb = embedder_for(VectorStore::open(&dir)?.embedder_id())?;
+            if checkpoint.is_some() && query_sync() {
+                // Replay the feed before reading, so this query sees the
+                // writes that came before it. A feed gap starts its rebuild
+                // and fails this query. Any other failure (LastDB busy or
+                // restarting) leaves the published index to answer; the next
+                // query replays from the same checkpoint.
+                if let Err(LastSeekError::OnlineFeedGap) =
+                    lastseek::online::catch_up(&dir, &table, emb.as_mut())
+                {
+                    lastseek::online::recover_in_background(lastseek::online::root_of(&dir)?)?;
+                    return Err(LastSeekError::OnlineFeedGap);
+                }
+            }
+            let store = VectorStore::open(&dir)?;
             if let Some(checkpoint) = checkpoint {
                 checkpoint.include_scopes(&mut table);
             }
-            let mut emb = embedder_for(store.embedder_id())?;
             let q = emb.embed_query(std::slice::from_ref(&text))?.remove(0);
             let opts = QueryOpts {
                 k: parse_flag(&args, "--k")?,

@@ -1,5 +1,9 @@
 # contrib — the host ingest policy
 
+An install from the app registry does not need these files. `lastseek query`
+keeps an online index current by itself (see the README). They remain for a
+host that drains the file inbox on a timer.
+
 These two files decide how often LastSeek's index is updated and how much it
 writes to disk doing it. Until 2026-08-17 they existed **only** as untracked
 files on one machine:

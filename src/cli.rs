@@ -102,6 +102,10 @@ Currently an alias for `status`. Same flags.
         usage: "\
 lastseek query <text> [--home DIR] [--k N] [--schema S]... [--min-score F] [--caller C]
 
+With no index, the first query builds one from live LastDB. With an online
+index, each query first replays the LastDB change feed (bounded).
+LASTSEEK_QUERY_SYNC=0 turns both off.
+
 Use --inbox DIR to select the same LastDB feed as drain. Otherwise the store uses its saved source inbox.
 
 Answers record keys and scores. The index retains no record text, so a
@@ -146,14 +150,17 @@ Folds the pending log into the slab and publishes a new generation.
     VerbSpec {
         verb: "rebuild",
         usage: "\
-lastseek rebuild [--home DIR] [--lastdb-socket PATH] [--schema NAME]...
+lastseek rebuild [--home DIR] [--lastdb-socket PATH] [--schema NAME]... [--if-absent]
 
 Rebuild the local Brain search index from live LastDB records, then follow
 the durable change feed. Defaults to all searchable Brain schemas. Use a
 separate --home for a subset if the active index holds other schemas.
+
+  --if-absent    do nothing when an online index is already published. The
+                 first query uses this to build the index once.
 ",
         value_flags: &["--lastdb-socket", "--schema", "--table"],
-        bool_flags: &[],
+        bool_flags: &["--if-absent"],
         positionals: 0,
     },
     VerbSpec {
