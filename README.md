@@ -54,7 +54,7 @@ and verify the fresh store before promoting it. Promotion must restore the store
 inbox to the live inbox. Stopping or restarting a shared database requires its owner's approval.
 
 Memory-mapped semantic vector search for LastDB. Canonical remote
-`https://github.com/EdgeVector/lastseek` (GitHub, private).
+`https://github.com/EdgeVector/lastseek` (GitHub, public).
 
 LastSeek runs **outside Mini**, so a default `lastdbd` ships no model weights
 and no inference runtime. The index is **local-only and regenerable** from
@@ -333,7 +333,7 @@ separate download is needed. `lastseek` looks for the model in this order:
    (the Homebrew location).
 
 The public binaries are licensed under Apache-2.0 (see `LICENSE`). Bundled
-third-party code is listed in `THIRD_PARTY_NOTICES`. The source stays private.
+third-party code is listed in `THIRD_PARTY_NOTICES`. The source is public under the same license.
 
 ### Fetching the bge-small-en-v1.5 weights
 
