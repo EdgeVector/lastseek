@@ -59,7 +59,7 @@ impl Block {
     fn error(self) -> LastSeekError {
         match self {
             Self::FeedGap => LastSeekError::OnlineFeedGap,
-            Self::SchemaChanged => invalid("searchable schemas changed; run lastseek rebuild"),
+            Self::SchemaChanged => invalid("indexed schemas changed; run lastseek rebuild"),
             Self::ListChanged => LastSeekError::ChangesListReplaced,
         }
     }
@@ -214,28 +214,19 @@ struct Importer<'a> {
 }
 
 impl Importer<'_> {
-    fn read(
-        &mut self,
-        schema: &str,
-        projection: &Projection,
-        keys: &[Key],
-    ) -> Result<Applied, LastSeekError> {
-        let ops = self.read_ops(schema, projection, keys)?;
+    fn read(&mut self, schema: &str, keys: &[Key]) -> Result<Applied, LastSeekError> {
+        let ops = self.read_ops(schema, keys)?;
         self.apply(&ops)
     }
 
-    fn read_ops(
-        &mut self,
-        schema: &str,
-        projection: &Projection,
-        keys: &[Key],
-    ) -> Result<Vec<PendingOp>, LastSeekError> {
+    fn read_ops(&mut self, schema: &str, keys: &[Key]) -> Result<Vec<PendingOp>, LastSeekError> {
         let mut ops = Vec::new();
         for keys in keys.chunks(READ_BATCH) {
-            let mut rows = self.source.records(schema, keys, projection)?;
+            let mut rows = self.source.records(schema, keys)?;
             let batch = Batch {
                 schema_name: schema.to_owned(),
-                searchable_fields: Some(projection.fields.clone()),
+                // Every field of a schema the caller named is embedded.
+                searchable_fields: None,
                 classifications: None,
                 changes: keys
                     .iter()
@@ -309,7 +300,7 @@ impl Importer<'_> {
         let mut ops = Vec::new();
         for (schema, keys) in changed_keys(page, projections)? {
             let keys: Vec<_> = keys.into_iter().collect();
-            ops.extend(self.read_ops(&schema, &projections[&schema], &keys)?);
+            ops.extend(self.read_ops(&schema, &keys)?);
         }
         // A restore between the feed read and hydration must not append
         // records from a different changes list to the active generation.
@@ -384,7 +375,7 @@ fn rebuild_locked(
     let source = Source(socket);
     let projections = search_catalog::projections(names, table)?;
     if previous_projections.is_some_and(|previous| *previous != projections) {
-        return Err(invalid("searchable schemas changed; run lastseek rebuild"));
+        return Err(invalid("indexed schemas changed; run lastseek rebuild"));
     }
     require_scope(&select(root)?.dir, &projections)?;
     let schema_names: Vec<String> = projections.keys().cloned().collect();
@@ -415,19 +406,19 @@ fn rebuild_locked(
             store: &mut store,
             embedder,
         };
-        for (schema, projection) in &projections {
+        for schema in projections.keys() {
             eprintln!("lastseek rebuild: reading {schema}");
             let mut after = None;
             let mut seen = BTreeSet::new();
             loop {
                 within_budget(started)?;
                 let page = importer.source.keys(schema, after.as_deref())?;
-                base.include(importer.read(schema, projection, &page.keys)?);
+                base.include(importer.read(schema, &page.keys)?);
                 key_pages += 1;
                 if importer.store.pending_ops() >= COMPACT_AT {
                     importer.store.compact()?;
                 }
-                if !page.has_more {
+                if page.next_cursor.is_none() {
                     break;
                 }
                 after = page.next_cursor;

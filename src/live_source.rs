@@ -1,11 +1,9 @@
-//! Read LastDB through the app API, plus the owner key listing used by rebuild.
+//! Read LastDB through the app API.
 //!
 //! The live feed is `POST /v1/x/changes`. Current records are `POST /v1/read`.
-//! `GET /api/list` stays on `lastseek rebuild` because the changes list keeps
-//! only the newest 250_000 entries (`CHANGES_KEEP` in LastDB). `after: 0`
-//! sets `gap` once an older entry has been dropped, and a live key whose last
-//! write fell out of that window is not in the reply. The app socket has no
-//! key listing, so rebuild cannot move onto it.
+//! A rebuild lists a schema's keys with a `keys_only` read that names no key,
+//! because the changes list keeps only its newest entries and so does not
+//! yield every live key.
 
 use crate::ingest::KeyValue;
 use crate::LastSeekError;
@@ -20,10 +18,6 @@ use std::process::{Command, Stdio};
 pub(crate) const KEY_PAGE: usize = 32;
 pub(crate) const READ_BATCH: usize = 64;
 pub(crate) const FEED_PAGE: usize = 500;
-
-/// Newest change entries LastDB keeps. Mirrors `CHANGES_KEEP` in
-/// `fold_db/crates/core/src/storage/format/metadata/changes.rs`.
-pub(crate) const CHANGES_KEEP: u64 = 250_000;
 
 pub(crate) fn invalid(message: impl Into<String>) -> LastSeekError {
     LastSeekError::Online(message.into())
@@ -42,18 +36,6 @@ pub(crate) struct SourceIdentity {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Projection {
     pub identity: String,
-    definition: String,
-    pub fields: Vec<String>,
-}
-
-impl Projection {
-    pub(crate) fn configured(identity: String, fields: Vec<String>) -> Self {
-        Self {
-            identity,
-            definition: "searchable-schemas.json".to_string(),
-            fields,
-        }
-    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -79,10 +61,17 @@ impl Key {
 
 #[derive(Deserialize)]
 pub(crate) struct Keys {
-    schema_id: String,
+    #[serde(default)]
     pub keys: Vec<Key>,
+    #[serde(default)]
     pub next_cursor: Option<String>,
-    pub has_more: bool,
+    #[serde(default)]
+    error: Option<ReadError>,
+}
+
+#[derive(Deserialize)]
+struct ReadError {
+    code: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -211,22 +200,30 @@ impl Source<'_> {
             .map_err(|_| invalid(format!("LastDB {route} returned an invalid response")))
     }
 
-    /// Owner key page. The app socket does not serve this route.
+    /// One page of a schema's primary keys. The last page has no cursor.
     pub(crate) fn keys(&self, schema: &str, cursor: Option<&str>) -> Result<Keys, LastSeekError> {
         #[derive(Deserialize)]
         struct Envelope {
-            list: Keys,
+            results: Vec<Keys>,
         }
-        let limit = KEY_PAGE.to_string();
-        let mut params = vec![("schema", schema), ("limit", limit.as_str())];
+        let mut read = json!({"schema": schema, "keys_only": true, "limit": KEY_PAGE});
         if let Some(cursor) = cursor {
-            params.push(("cursor", cursor));
+            read["cursor"] = json!(cursor);
         }
-        let mut page = self.request::<Envelope>("/api/list", &params, None)?.list;
-        if page.schema_id != schema
-            || page.keys.len() > KEY_PAGE
-            || (page.has_more
-                && (page.next_cursor.is_none() || page.next_cursor.as_deref() == cursor))
+        let response: Envelope = self.request("/v1/read", &[], Some(json!({"reads": [read]})))?;
+        let mut pages = response.results.into_iter();
+        let (Some(mut page), None) = (pages.next(), pages.next()) else {
+            return Err(invalid("LastDB returned a key list of the wrong length"));
+        };
+        if let Some(error) = &page.error {
+            return Err(invalid(format!(
+                "LastDB refused a key list of {schema} ({})",
+                error.code
+            )));
+        }
+        if page.keys.len() > KEY_PAGE
+            || page.keys.iter().any(|key| key.hash.is_empty())
+            || (page.next_cursor.is_some() && page.next_cursor.as_deref() == cursor)
         {
             return Err(invalid("LastDB returned an invalid primary key page"));
         }
@@ -238,7 +235,6 @@ impl Source<'_> {
         &self,
         schema: &str,
         keys: &[Key],
-        projection: &Projection,
     ) -> Result<BTreeMap<Key, BTreeMap<String, Value>>, LastSeekError> {
         #[derive(Deserialize)]
         struct Envelope {
@@ -255,10 +251,6 @@ impl Source<'_> {
         struct ReadRecord {
             key: Key,
             record: BTreeMap<String, Value>,
-        }
-        #[derive(Deserialize)]
-        struct ReadError {
-            code: String,
         }
         if keys.is_empty() {
             return Ok(BTreeMap::new());
@@ -297,9 +289,7 @@ impl Source<'_> {
                     "LastDB returned an unexpected or repeated primary key",
                 ));
             }
-            let mut fields = row.record;
-            fields.retain(|field, _| projection.fields.contains(field));
-            records.insert(found, fields);
+            records.insert(found, row.record);
         }
         Ok(records)
     }
@@ -375,14 +365,6 @@ fn split_http_status(stdout: &[u8]) -> Result<(&[u8], u16), LastSeekError> {
 }
 
 fn route_failure(route: &str, status: u16) -> LastSeekError {
-    if route == "/api/list" && status == 404 {
-        return invalid(format!(
-            "LastDB /api/list request failed (HTTP 404). The app API has no key listing. \
-             lastseek rebuild stays on the owner socket: the changes list keeps the newest \
-             {CHANGES_KEEP} entries, and after 0 sets gap once an older entry is dropped, \
-             so the list does not yield every live key"
-        ));
-    }
     invalid(format!("LastDB {route} request failed (HTTP {status})"))
 }
 

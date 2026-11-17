@@ -1,28 +1,29 @@
 # LastSeek
 
-For local Brain records, rebuild the index while LastDB is running. Rebuild
-lists keys on the owner socket (`GET /api/list`). The app socket cannot list
-keys, and `POST /v1/x/changes` from `after: 0` does not yield every live key:
-LastDB keeps the newest 250,000 change entries and sets `gap` once an older
-entry is dropped.
+The app that wants search names the schemas to index. LastSeek keeps no list
+of its own: a schema no app named is never read and never indexed. Every field
+of a named schema is embedded.
 
 ```sh
-lastseek rebuild
+lastseek rebuild --schema brain/Design --schema brain/Decision
 ```
 
-LastSeek lists primary keys, reads the current records with `POST /v1/read`
-(up to 64 keys at a time), and catches up on `POST /v1/x/changes`. It builds
-the replacement separately and publishes the vectors and the changes position
-(`through`, plus the list `id`) together. The existing `lastseek drain`
-command then follows that position, including updates and deletions. A changed
-list `id` voids the position. A gap, or a changed `id`, starts a replacement
-index while LastDB stays online. That replacement still needs the owner
-socket's key listing. A socket failure can be retried from the same
-checkpoint. The searchable fields come from `searchable-schemas.json` in this
-repo, not from `GET /api/schemas`. `lastseek status` reports the list id,
+LastSeek lists each schema's primary keys with a `keys_only` `POST /v1/read`
+that names no key, reads the current records with `POST /v1/read` (up to 64
+keys at a time), and catches up on `POST /v1/x/changes`. The key list is
+needed because the changes list keeps only its newest 250,000 entries. It
+builds the replacement separately and publishes the vectors and the changes
+position (`through`, plus the list `id`) together. The existing
+`lastseek drain` command then follows that position, including updates and
+deletions. A changed list `id` voids the position. A gap, or a changed `id`,
+starts a replacement index while LastDB stays online. A socket failure can be
+retried from the same checkpoint. `lastseek status` reports the list id,
 resumed restarts and completed gap rebuilds for the online store.
 
-This workflow covers searchable Brain schemas and ordinary local writes.
+As a restricted app, LastSeek can read only the schemas on `access.read` in
+`lastdb-app.json`. A request for any other schema is refused by LastDB.
+
+This workflow covers ordinary local writes.
 On a machine where the default index serves other apps too, run
 `lastseek rebuild --home ~/.lastseek/brain-index`. A query naming only
 Brain schemas uses this published index when it covers the entire query.

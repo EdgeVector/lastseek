@@ -148,11 +148,10 @@ Folds the pending log into the slab and publishes a new generation.
         usage: "\
 lastseek rebuild [--home DIR] [--lastdb-socket PATH] [--schema NAME]...
 
-Rebuild the local Brain search index from live LastDB records, then follow
-the changes extension. Key listing uses the owner socket: the app API cannot
-list keys, and the changes list does not retain every live key. Defaults to
-the configured searchable Brain schemas. Use a separate --home for a subset
-if the active index holds other schemas.
+Build a search index of the named schemas from live LastDB records, then
+follow the changes extension. The app that wants search names its schemas;
+LastSeek indexes nothing else, and embeds every field of a named schema. Use a
+separate --home for each app's index.
 ",
         value_flags: &["--lastdb-socket", "--schema", "--table"],
         bool_flags: &[],

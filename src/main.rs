@@ -76,7 +76,7 @@ and requires a build with `--features neural`.
 
 The online drain follows POST /v1/x/changes and reads records with POST /v1/read.
 It sends X-LastDB-App-Session when LASTDB_APP_SESSION is set. `lastseek rebuild`
-still lists keys with GET /api/list on the owner socket.
+lists a schema's keys with a keys_only POST /v1/read.
 ";
 
 fn home(args: &[String]) -> std::path::PathBuf {
