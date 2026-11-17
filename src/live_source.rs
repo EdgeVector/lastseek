@@ -1,9 +1,14 @@
-//! Read the local LastDB owner socket using existing catalog, key and feed APIs.
+//! Read LastDB through the app API.
+//!
+//! The live feed is `POST /v1/x/changes`. Current records are `POST /v1/read`.
+//! A rebuild lists a schema's keys with a `keys_only` read that names no key,
+//! because the changes list keeps only its newest entries and so does not
+//! yield every live key.
 
-use crate::ingest::{field_is_indexable, KeyValue};
-use crate::schema::SchemaTable;
+use crate::ingest::KeyValue;
 use crate::LastSeekError;
-use serde::{de::DeserializeOwned, Deserialize, Serialize};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -11,6 +16,7 @@ use std::path::Path;
 use std::process::{Command, Stdio};
 
 pub(crate) const KEY_PAGE: usize = 32;
+pub(crate) const READ_BATCH: usize = 64;
 pub(crate) const FEED_PAGE: usize = 500;
 
 pub(crate) fn invalid(message: impl Into<String>) -> LastSeekError {
@@ -19,17 +25,17 @@ pub(crate) fn invalid(message: impl Into<String>) -> LastSeekError {
 
 pub(crate) struct Source<'a>(pub &'a Path);
 
+/// Identity of one changes list. A different `id` means a restore replaced
+/// the database and any saved position is void. This replaces the owner
+/// boot-identity check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct SourceIdentity {
-    pid: u32,
-    process_start_ts: u64,
+    pub id: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Projection {
     pub identity: String,
-    definition: String,
-    pub fields: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize)]
@@ -44,58 +50,71 @@ impl Key {
         self.range = self.range.filter(|range| !range.is_empty());
         self
     }
-}
 
-#[derive(Deserialize)]
-pub(crate) struct Keys {
-    schema_id: String,
-    pub keys: Vec<Key>,
-    pub next_cursor: Option<String>,
-    pub has_more: bool,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct Change {
-    cursor: String,
-    mutation_id: String,
-    pub schema_name: String,
-    key: KeyValue,
-}
-
-#[derive(Deserialize)]
-pub(crate) struct FeedPage {
-    pub changes: Vec<Change>,
-    pub next_cursor: String,
-    pub has_more: bool,
-    gap: bool,
-}
-
-#[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct FeedPosition {
-    pub cursor: String,
-    #[serde(default)]
-    pub anchor: Option<String>,
-}
-
-impl FeedPage {
-    pub(crate) fn position(&self, previous: Option<&FeedPosition>) -> FeedPosition {
-        FeedPosition {
-            cursor: self.next_cursor.clone(),
-            anchor: self
-                .changes
-                .last()
-                .map(|change| change.mutation_id.clone())
-                .or_else(|| previous.and_then(|position| position.anchor.clone())),
+    fn json(&self) -> Value {
+        match &self.range {
+            Some(range) => json!({"hash": self.hash, "range": range}),
+            None => json!({"hash": self.hash}),
         }
     }
 }
 
-fn sequence(cursor: &str) -> Result<u64, LastSeekError> {
-    cursor
-        .strip_prefix("v1-")
-        .filter(|raw| raw.len() == 16)
-        .and_then(|raw| u64::from_str_radix(raw, 16).ok())
-        .ok_or_else(|| invalid("LastDB returned an invalid change cursor"))
+#[derive(Deserialize)]
+pub(crate) struct Keys {
+    #[serde(default)]
+    pub keys: Vec<Key>,
+    #[serde(default)]
+    pub next_cursor: Option<String>,
+    #[serde(default)]
+    error: Option<ReadError>,
+}
+
+#[derive(Deserialize)]
+struct ReadError {
+    code: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct Change {
+    pub seq: u64,
+    pub schema: String,
+    pub key: KeyValue,
+    /// The following read decides whether the key is still live.
+    #[serde(default)]
+    #[allow(dead_code)]
+    pub deleted: bool,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct FeedPage {
+    pub id: String,
+    pub head: u64,
+    pub through: u64,
+    pub gap: bool,
+    pub changes: Vec<Change>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct FeedPosition {
+    pub through: u64,
+}
+
+impl FeedPage {
+    pub(crate) fn caught_up(&self) -> bool {
+        !self.gap && self.through >= self.head
+    }
+}
+
+/// `X-LastDB-App-Session` when the launcher set `LASTDB_APP_SESSION`.
+pub fn session_header() -> Result<Option<String>, LastSeekError> {
+    match std::env::var("LASTDB_APP_SESSION") {
+        Err(_) => Ok(None),
+        Ok(value) if value.is_empty() => Ok(None),
+        Ok(value) if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') => {
+            Err(invalid("LASTDB_APP_SESSION contains a line break"))
+        }
+        Ok(value) => Ok(Some(format!("X-LastDB-App-Session: {value}"))),
+    }
 }
 
 fn encode_query_value(value: &str) -> String {
@@ -131,11 +150,15 @@ impl Source<'_> {
         }
         let mut command = Command::new("curl");
         command
-            .args(["--disable", "--fail", "--silent", "--max-time", "30"])
+            .args(["--disable", "--silent", "--show-error", "--max-time", "30"])
             .args(["-H", "X-LastDB-Client: lastseek"])
+            .args(["-w", "\n%{http_code}"])
             .arg("--unix-socket")
             .arg(self.0)
             .arg(url);
+        if let Some(header) = session_header()? {
+            command.args(["-H", &header]);
+        }
         let mut body_bytes = None;
         if let Some(body) = body {
             body_bytes = Some(serde_json::to_vec(&body)?);
@@ -161,107 +184,46 @@ impl Source<'_> {
             None => Ok(()),
         };
         let out = child.wait_with_output()?;
+        written?;
         if !out.status.success() {
             return Err(invalid(format!(
                 "LastDB {route} request failed ({})",
                 out.status
             )));
         }
-        written?;
+        let (payload, status) = split_http_status(&out.stdout)?;
+        if status != 200 {
+            return Err(route_failure(route, status));
+        }
         // Parser errors can include input values. Keep record values out of errors.
-        serde_json::from_slice(&out.stdout)
+        serde_json::from_slice(payload)
             .map_err(|_| invalid(format!("LastDB {route} returned an invalid response")))
     }
 
-    pub(crate) fn identity(&self) -> Result<SourceIdentity, LastSeekError> {
-        self.request("/api/system/boot-identity", &[], None)
-    }
-
-    pub(crate) fn require_boot(&self, boot: &SourceIdentity) -> Result<(), LastSeekError> {
-        if self.identity()? != *boot {
-            return Err(invalid("LastDB restarted during the read; retry the drain"));
-        }
-        Ok(())
-    }
-
-    pub(crate) fn projections(
-        &self,
-        names: &[String],
-        table: &SchemaTable,
-    ) -> Result<BTreeMap<String, Projection>, LastSeekError> {
-        #[derive(Deserialize)]
-        struct Catalog {
-            ready: bool,
-            schemas: Vec<Schema>,
-        }
-        #[derive(Deserialize)]
-        struct Schema {
-            name: String,
-            owner_app_id: Option<String>,
-            identity_hash: Option<String>,
-            state: Option<String>,
-            schema_type: String,
-            #[serde(default)]
-            field_classifications: BTreeMap<String, Vec<String>>,
-        }
-        let catalog: Catalog = self.request("/api/schemas", &[("include_full", "true")], None)?;
-        if !catalog.ready {
-            return Err(invalid("LastDB schema catalog is not ready"));
-        }
-        let mut projections = BTreeMap::new();
-        for schema in catalog.schemas {
-            if schema.owner_app_id.as_deref() != Some("brain")
-                || !schema.name.starts_with("brain/")
-                || schema.state.as_deref() != Some("Available")
-                || !matches!(schema.schema_type.as_str(), "Hash" | "HashRange")
-                || (!names.is_empty() && !names.contains(&schema.name))
-            {
-                continue;
-            }
-            let fields: Vec<_> = schema
-                .field_classifications
-                .into_iter()
-                .filter(|(_, classes)| !classes.is_empty() && field_is_indexable(Some(classes)))
-                .map(|(field, _)| field)
-                .collect();
-            if fields.is_empty() {
-                continue;
-            }
-            let definition = schema
-                .identity_hash
-                .filter(|identity| !identity.is_empty())
-                .ok_or_else(|| invalid("a searchable Brain schema has no definition identity"))?;
-            let identity = table
-                .identity_for_name(&schema.name)
-                .unwrap_or(&schema.name)
-                .into();
-            projections.insert(
-                schema.name,
-                Projection {
-                    identity,
-                    definition,
-                    fields,
-                },
-            );
-        }
-        Ok(projections)
-    }
-
+    /// One page of a schema's primary keys. The last page has no cursor.
     pub(crate) fn keys(&self, schema: &str, cursor: Option<&str>) -> Result<Keys, LastSeekError> {
         #[derive(Deserialize)]
         struct Envelope {
-            list: Keys,
+            results: Vec<Keys>,
         }
-        let limit = KEY_PAGE.to_string();
-        let mut params = vec![("schema", schema), ("limit", limit.as_str())];
+        let mut read = json!({"schema": schema, "keys_only": true, "limit": KEY_PAGE});
         if let Some(cursor) = cursor {
-            params.push(("cursor", cursor));
+            read["cursor"] = json!(cursor);
         }
-        let mut page = self.request::<Envelope>("/api/list", &params, None)?.list;
-        if page.schema_id != schema
-            || page.keys.len() > KEY_PAGE
-            || (page.has_more
-                && (page.next_cursor.is_none() || page.next_cursor.as_deref() == cursor))
+        let response: Envelope = self.request("/v1/read", &[], Some(json!({"reads": [read]})))?;
+        let mut pages = response.results.into_iter();
+        let (Some(mut page), None) = (pages.next(), pages.next()) else {
+            return Err(invalid("LastDB returned a key list of the wrong length"));
+        };
+        if let Some(error) = &page.error {
+            return Err(invalid(format!(
+                "LastDB refused a key list of {schema} ({})",
+                error.code
+            )));
+        }
+        if page.keys.len() > KEY_PAGE
+            || page.keys.iter().any(|key| key.hash.is_empty())
+            || (page.next_cursor.is_some() && page.next_cursor.as_deref() == cursor)
         {
             return Err(invalid("LastDB returned an invalid primary key page"));
         }
@@ -273,131 +235,173 @@ impl Source<'_> {
         &self,
         schema: &str,
         keys: &[Key],
-        projection: &Projection,
     ) -> Result<BTreeMap<Key, BTreeMap<String, Value>>, LastSeekError> {
         #[derive(Deserialize)]
         struct Envelope {
-            results: Vec<Row>,
-            has_more: bool,
+            results: Vec<ReadResult>,
         }
         #[derive(Deserialize)]
-        struct Row {
-            key: Key,
-            fields: BTreeMap<String, Value>,
+        struct ReadResult {
+            #[serde(default)]
+            records: Vec<ReadRecord>,
+            #[serde(default)]
+            error: Option<ReadError>,
         }
-        let pairs: Vec<_> = keys
+        #[derive(Deserialize)]
+        struct ReadRecord {
+            key: Key,
+            record: BTreeMap<String, Value>,
+        }
+        if keys.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        if keys.len() > READ_BATCH {
+            return Err(invalid("a record read exceeds 64 keys"));
+        }
+        let reads: Vec<Value> = keys
             .iter()
-            .map(|key| (&key.hash, key.range.as_deref().unwrap_or("")))
+            .map(|key| json!({"schema": schema, "key": key.json()}))
             .collect();
-        let body =
-            json!({"schema_name":schema,"filter":{"HashRangeKeys":pairs},"limit":keys.len()});
-        let response: Envelope = self.request("/api/query", &[], Some(body))?;
-        if response.has_more {
-            return Err(invalid("LastDB truncated a primary-key batch read"));
+        let response: Envelope = self.request("/v1/read", &[], Some(json!({"reads": reads})))?;
+        if response.results.len() != keys.len() {
+            return Err(invalid(
+                "LastDB returned a record batch of the wrong length",
+            ));
         }
         let mut records = BTreeMap::new();
-        for row in response.results {
-            let key = row.key.normalized();
-            if !keys.contains(&key) || records.contains_key(&key) {
+        for (key, result) in keys.iter().zip(response.results) {
+            if let Some(error) = result.error {
+                return Err(invalid(format!(
+                    "LastDB refused a record read ({})",
+                    error.code
+                )));
+            }
+            if result.records.is_empty() {
+                continue;
+            }
+            if result.records.len() != 1 {
+                return Err(invalid("LastDB returned more than one record for a key"));
+            }
+            let row = result.records.into_iter().next().expect("one record");
+            let found = row.key.normalized();
+            if &found != key || records.contains_key(&found) {
                 return Err(invalid(
                     "LastDB returned an unexpected or repeated primary key",
                 ));
             }
-            let mut fields = row.fields;
-            fields.retain(|field, _| projection.fields.contains(field));
-            records.insert(key, fields);
+            records.insert(found, row.record);
         }
         Ok(records)
     }
 
+    /// One page of `POST /v1/x/changes`. `gap` stays on the page so the caller
+    /// can tell a replaced list (`id`) from a trimmed window.
     pub(crate) fn changes(
         &self,
-        after: Option<&str>,
+        after: u64,
         limit: usize,
+        schemas: &[String],
     ) -> Result<FeedPage, LastSeekError> {
+        if schemas.is_empty() {
+            return Err(invalid("a changes read needs the schemas LastSeek indexes"));
+        }
         let page: FeedPage = self.request(
-            "/api/app/changes",
+            "/v1/x/changes",
             &[],
-            Some(json!({"since_cursor":after,"limit":limit})),
+            Some(json!({"after": after, "limit": limit, "schemas": schemas})),
         )?;
+        if page.id.is_empty() {
+            return Err(invalid("LastDB returned a changes list with no id"));
+        }
         if page.gap {
-            return Err(LastSeekError::OnlineFeedGap);
+            return Ok(page);
         }
-        let mut prior = after.map(sequence).transpose()?;
+        if page.through < after {
+            return Err(invalid(
+                "LastDB returned a changes position before the request",
+            ));
+        }
+        if limit == 0 {
+            if page.through != after || !page.changes.is_empty() {
+                return Err(invalid("LastDB returned changes for a head-only read"));
+            }
+            return Ok(page);
+        }
+        let mut prior = after;
         for change in &page.changes {
-            let next = sequence(&change.cursor)?;
-            if prior.is_some_and(|prior| prior.checked_add(1) != Some(next)) {
-                return Err(LastSeekError::OnlineFeedGap);
+            if change.seq <= prior || change.schema.is_empty() {
+                return Err(invalid("LastDB returned a change outside the page"));
             }
-            if change.mutation_id.is_empty() {
-                return Err(invalid("LastDB returned a change without a mutation ID"));
+            if change.key.hash.as_deref().unwrap_or("").is_empty() {
+                return Err(invalid("a change has no primary hash"));
             }
-            prior = Some(next);
+            prior = change.seq;
         }
-        let next = sequence(&page.next_cursor)?;
-        if next != prior.unwrap_or(0) || (page.has_more && page.changes.is_empty()) {
-            return Err(LastSeekError::OnlineFeedGap);
+        if page.through == after && page.through < page.head {
+            return Err(invalid(
+                "LastDB returned no progress toward the changes head",
+            ));
         }
         Ok(page)
     }
 
-    pub(crate) fn anchor_at(&self, cursor: &str) -> Result<Option<String>, LastSeekError> {
-        let Some(before) = sequence(cursor)?.checked_sub(1) else {
-            return Ok(None);
-        };
-        let before = format!("v1-{before:016x}");
-        match self.changes(Some(&before), 1) {
-            Ok(page) => Ok(page
-                .changes
-                .into_iter()
-                .find(|change| change.cursor == cursor)
-                .map(|change| change.mutation_id)),
-            Err(LastSeekError::OnlineFeedGap) => Ok(None),
-            Err(error) => Err(error),
-        }
-    }
-
-    pub(crate) fn head(&self) -> Result<FeedPosition, LastSeekError> {
-        let mut position: Option<FeedPosition> = None;
-        for _ in 0..1_000 {
-            let page = self.changes(
-                position.as_ref().map(|position| position.cursor.as_str()),
-                FEED_PAGE,
-            )?;
-            let next = page.position(position.as_ref());
-            if !page.has_more {
-                return Ok(next);
-            }
-            position = Some(next);
-        }
-        Err(invalid(
-            "could not reach the LastDB change feed head within the page limit",
-        ))
+    /// `limit: 0` reads `id` and `head` without entries. `gap` on `after: 0`
+    /// is normal once retention has trimmed the list; `head` is still current.
+    pub(crate) fn changes_head(&self, schemas: &[String]) -> Result<FeedPage, LastSeekError> {
+        self.changes(0, 0, schemas)
     }
 }
 
-/// Coalesce the latest hints. Each key is read from LastDB after the page arrived.
+fn split_http_status(stdout: &[u8]) -> Result<(&[u8], u16), LastSeekError> {
+    let Some(split) = stdout.iter().rposition(|byte| *byte == b'\n') else {
+        return Err(invalid("LastDB returned a response without a status"));
+    };
+    let code = std::str::from_utf8(&stdout[split + 1..])
+        .ok()
+        .filter(|code| code.len() == 3 && code.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|code| code.parse().ok())
+        .ok_or_else(|| invalid("LastDB returned a response without a status"))?;
+    Ok((&stdout[..split], code))
+}
+
+fn route_failure(route: &str, status: u16) -> LastSeekError {
+    invalid(format!("LastDB {route} request failed (HTTP {status})"))
+}
+
+/// Coalesce the latest keys. Each key is read from LastDB after the page arrived.
 pub(crate) fn changed_keys(
     page: &FeedPage,
     projections: &BTreeMap<String, Projection>,
 ) -> Result<BTreeMap<String, BTreeSet<Key>>, LastSeekError> {
     let mut keys: BTreeMap<String, BTreeSet<Key>> = BTreeMap::new();
     for change in &page.changes {
-        if projections.contains_key(&change.schema_name) {
-            let hash = change
-                .key
-                .hash
-                .clone()
-                .ok_or_else(|| invalid("a Brain change has no primary hash"))?;
-            let key = Key {
-                hash,
-                range: change.key.range.clone(),
-            }
-            .normalized();
-            keys.entry(change.schema_name.clone())
-                .or_default()
-                .insert(key);
+        if !projections.contains_key(&change.schema) {
+            continue;
         }
+        let hash = change
+            .key
+            .hash
+            .clone()
+            .filter(|hash| !hash.is_empty())
+            .ok_or_else(|| invalid("a Brain change has no primary hash"))?;
+        let key = Key {
+            hash,
+            range: change.key.range.clone(),
+        }
+        .normalized();
+        keys.entry(change.schema.clone()).or_default().insert(key);
     }
     Ok(keys)
+}
+
+/// A saved position is void when the list id changed. A gap means entries
+/// were dropped. Call this only after comparing `id`.
+pub(crate) fn page_break(page: &FeedPage, saved: &SourceIdentity) -> Option<LastSeekError> {
+    if page.id != saved.id {
+        return Some(LastSeekError::ChangesListReplaced);
+    }
+    if page.gap {
+        return Some(LastSeekError::OnlineFeedGap);
+    }
+    None
 }

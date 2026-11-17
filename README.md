@@ -1,23 +1,29 @@
 # LastSeek
 
-For local Brain records, rebuild the index while LastDB is running:
+The app that wants search names the schemas to index. LastSeek keeps no list
+of its own: a schema no app named is never read and never indexed. Every field
+of a named schema is embedded.
 
 ```sh
-lastseek rebuild
+lastseek rebuild --schema brain/Design --schema brain/Decision
 ```
 
-LastSeek lists primary keys, reads the current records in batches, and catches
-up on LastDB's durable app change feed. It builds the replacement separately
-and publishes the vectors and feed cursor together. The existing `lastseek
-drain` command then follows that cursor, including updates and deletions.
-After LastDB restarts, the drain checks the saved cursor's mutation ID and
-continues from that cursor when it matches. A gap or an unverifiable cursor
-starts a replacement index while LastDB stays online. A socket failure can
-be retried from the same checkpoint. Changed searchable schema definitions
-require an explicit rebuild. `lastseek status` reports the saved anchor,
+LastSeek lists each schema's primary keys with a `keys_only` `POST /v1/read`
+that names no key, reads the current records with `POST /v1/read` (up to 64
+keys at a time), and catches up on `POST /v1/x/changes`. The key list is
+needed because the changes list keeps only its newest 250,000 entries. It
+builds the replacement separately and publishes the vectors and the changes
+position (`through`, plus the list `id`) together. The existing
+`lastseek drain` command then follows that position, including updates and
+deletions. A changed list `id` voids the position. A gap, or a changed `id`,
+starts a replacement index while LastDB stays online. A socket failure can be
+retried from the same checkpoint. `lastseek status` reports the list id,
 resumed restarts and completed gap rebuilds for the online store.
 
-This workflow covers searchable Brain schemas and ordinary local writes.
+As a restricted app, LastSeek can read only the schemas on `access.read` in
+`lastdb-app.json`. A request for any other schema is refused by LastDB.
+
+This workflow covers ordinary local writes.
 On a machine where the default index serves other apps too, run
 `lastseek rebuild --home ~/.lastseek/brain-index`. A query naming only
 Brain schemas uses this published index when it covers the entire query.
@@ -328,9 +334,16 @@ model goes under the formula's pkgshare,
 separate download is needed. `lastseek` looks for the model in this order:
 
 1. `$LASTSEEK_MODEL_DIR`, when set (an explicit override).
-2. `~/.lastseek/models/bge-small-en-v1.5`, when it holds `model.onnx`.
-3. `share/lastseek/models/bge-small-en-v1.5` next to the installed binary
+2. `$LASTDB_APP_DATA/models/bge-small-en-v1.5`, when the launcher set that
+   directory and it holds `model.onnx`.
+3. `~/.lastseek/models/bge-small-en-v1.5`, when app data is unset and the
+   directory holds `model.onnx`.
+4. `share/lastseek/models/bge-small-en-v1.5` next to the installed binary
    (the Homebrew location).
+
+When `LASTDB_APP_DATA` is set, the index, changes cursor, schema table and
+declared counts default to that directory. Without it, they stay under
+`~/.lastseek`.
 
 The public binaries are licensed under Apache-2.0 (see `LICENSE`). Bundled
 third-party code is listed in `THIRD_PARTY_NOTICES`. The source is public under the same license.

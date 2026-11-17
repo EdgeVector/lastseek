@@ -148,9 +148,10 @@ Folds the pending log into the slab and publishes a new generation.
         usage: "\
 lastseek rebuild [--home DIR] [--lastdb-socket PATH] [--schema NAME]...
 
-Rebuild the local Brain search index from live LastDB records, then follow
-the durable change feed. Defaults to all searchable Brain schemas. Use a
-separate --home for a subset if the active index holds other schemas.
+Build a search index of the named schemas from live LastDB records, then
+follow the changes extension. The app that wants search names its schemas;
+LastSeek indexes nothing else, and embeds every field of a named schema. Use a
+separate --home for each app's index.
 ",
         value_flags: &["--lastdb-socket", "--schema", "--table"],
         bool_flags: &[],
@@ -159,7 +160,7 @@ separate --home for a subset if the active index holds other schemas.
     VerbSpec {
         verb: "drain",
         usage: "\
-lastseek drain [--home DIR] [--inbox DIR] [--max-files N] [--consume]
+lastseek drain [--home DIR] [--lastdb-socket PATH] [--inbox DIR] [--max-files N] [--consume]
 
 Applies the host's IndexChangeBatch feed. BOUNDED: --max-files defaults to
 2000 and `remaining` reports what the cap left behind, because an unbounded
@@ -168,11 +169,12 @@ machine down on 2026-08-07.
 
   --consume      DELETE each batch file after applying it.
 
-After an online rebuild, drain reads the durable feed and --max-files caps
-the number of change events. File consumption only applies to inbox stores.
-The online drain resumes after a verified LastDB restart and rebuilds on a gap.
+After an online rebuild, drain follows POST /v1/x/changes and --max-files caps
+the number of change events. The socket is $LASTDB_SOCKET_PATH when the
+launcher set it. A changed list id or a gap rebuilds the index. File
+consumption only applies to inbox stores.
 ",
-        value_flags: &["--table", "--inbox", "--max-files"],
+        value_flags: &["--table", "--lastdb-socket", "--inbox", "--max-files"],
         bool_flags: &["--consume"],
         positionals: 0,
     },

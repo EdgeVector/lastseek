@@ -195,6 +195,9 @@ impl SchemaTable {
         if let Ok(v) = std::env::var("LASTSEEK_SCHEMA_TABLE") {
             return v.into();
         }
+        if let Some(data) = crate::app_data_dir() {
+            return data.join("schema-table.json");
+        }
         let base = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         Path::new(&base).join(".lastseek").join("schema-table.json")
     }
