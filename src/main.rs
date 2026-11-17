@@ -89,8 +89,10 @@ share/lastseek/models/bge-small-en-v1.5 (the Homebrew formula puts it there),
 and requires a build with `--features neural`.
 
 The online drain follows POST /v1/x/changes and reads records with POST /v1/read.
-It sends X-LastDB-App-Session when LASTDB_APP_SESSION is set. `lastseek rebuild`
-lists a schema's keys with a keys_only POST /v1/read.
+It sends X-LastDB-App when LASTDB_APP is lastseek. With LASTDB_APP unset it
+sends no app id. Another app's id is ignored, and so is that app's
+LASTDB_SOCKET_PATH. `lastseek rebuild` lists a schema's keys with a keys_only
+POST /v1/read.
 ";
 
 fn home(args: &[String]) -> std::path::PathBuf {
@@ -188,29 +190,34 @@ fn fetch_schema_table(src: &str) -> Result<SchemaTable, LastSeekError> {
     SchemaTable::from_available_json(&out.stdout, src)
 }
 
-fn lastdb_socket(args: &[String]) -> std::path::PathBuf {
+fn lastdb_socket(args: &[String]) -> Result<std::path::PathBuf, LastSeekError> {
     if let Some(path) = flag_value(args, "--lastdb-socket") {
-        return path.into();
+        return Ok(path.into());
     }
-    if let Ok(path) = std::env::var("LASTDB_SOCKET_PATH") {
-        if !path.is_empty() {
-            return path.into();
+    // A developer or CI job names this path itself and leaves LASTDB_APP
+    // unset. The launcher sets both for LastSeek. Another app's path is
+    // that app's socket, so it is not used.
+    if lastseek::honor_lastdb_socket_path()? {
+        if let Ok(path) = std::env::var("LASTDB_SOCKET_PATH") {
+            if !path.is_empty() {
+                return Ok(path.into());
+            }
         }
     }
     if let Ok(path) = std::env::var("LASTSEEK_LASTDB_SOCKET") {
-        return path.into();
+        return Ok(path.into());
     }
     if let Ok(path) = std::env::var("LASTDB_SOCKET") {
-        return path.into();
+        return Ok(path.into());
     }
     if let Ok(home) = std::env::var("LASTDB_HOME") {
-        return std::path::Path::new(&home).join("data").join("folddb.sock");
+        return Ok(std::path::Path::new(&home).join("data").join("folddb.sock"));
     }
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".into());
-    std::path::Path::new(&home)
+    Ok(std::path::Path::new(&home)
         .join(".lastdb")
         .join("data")
-        .join("folddb.sock")
+        .join("folddb.sock"))
 }
 
 /// Read source record counts from LastDB over the Unix socket.
@@ -218,7 +225,7 @@ fn lastdb_socket(args: &[String]) -> std::path::PathBuf {
 /// Ingest reads LastDB changes and status reads the node's catalog at
 /// `/api/schemas?include_counts=true`.
 fn fetch_lastdb_catalog(args: &[String]) -> Result<(Vec<u8>, String), LastSeekError> {
-    let socket = lastdb_socket(args);
+    let socket = lastdb_socket(args)?;
     let socket_text = socket.to_string_lossy().to_string();
     let url = "http://localhost/api/schemas?include_counts=true";
     let mut command = std::process::Command::new("curl");
@@ -233,7 +240,7 @@ fn fetch_lastdb_catalog(args: &[String]) -> Result<(Vec<u8>, String), LastSeekEr
         &socket_text,
         url,
     ]);
-    if let Some(header) = lastseek::session_header()? {
+    if let Some(header) = lastseek::app_header()? {
         command.args(["-H", &header]);
     }
     let out = command.output()?;
@@ -379,7 +386,7 @@ fn run() -> Result<(), LastSeekError> {
     let root = home(&args);
     if cmd == "rebuild" {
         let table = load_schema_table(&args);
-        let socket = std::path::absolute(lastdb_socket(&args))?;
+        let socket = std::path::absolute(lastdb_socket(&args)?)?;
         let mut embedder = embedder_for("fastembed/bge-small-en-v1.5")?;
         if embedder.id() != "fastembed/bge-small-en-v1.5" {
             return Err(LastSeekError::Online(
@@ -822,7 +829,7 @@ fn run() -> Result<(), LastSeekError> {
                     return Err(LastSeekError::Online("--max-files must be positive".into()));
                 }
                 let mut embedder = embedder_for(VectorStore::open(&dir)?.embedder_id())?;
-                let socket = std::path::absolute(lastdb_socket(&args))?;
+                let socket = std::path::absolute(lastdb_socket(&args)?)?;
                 let attempt = lastseek::online::drain(
                     &dir,
                     checkpoint.clone(),

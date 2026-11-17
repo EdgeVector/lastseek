@@ -13,7 +13,7 @@ pub mod embed;
 pub mod index;
 pub mod ingest;
 mod live_source;
-pub use live_source::session_header;
+pub use live_source::{app_header, honor_lastdb_socket_path, retain_own_launcher_env};
 pub mod metrics;
 pub mod online;
 pub mod schema;

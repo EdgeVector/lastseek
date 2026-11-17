@@ -51,6 +51,11 @@ and the answer comes from the index already published, with `stale` set.
 As a restricted app, LastSeek can read only the schemas on `access.read` in
 `lastdb-app.json`. A request for any other schema is refused by LastDB.
 
+The launcher sets `LASTDB_APP` to `lastseek` and `LASTDB_SOCKET_PATH` to the
+app socket. LastSeek then sends `X-LastDB-App: lastseek`. With `LASTDB_APP`
+unset, it sends no app id and talks to the owner socket. An id of another
+app is not used, and that app's socket path is not used either.
+
 This workflow covers ordinary local writes. The online drain compacts when
 its pending log reaches the store threshold.
 
