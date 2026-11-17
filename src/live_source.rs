@@ -105,16 +105,68 @@ impl FeedPage {
     }
 }
 
-/// `X-LastDB-App-Session` when the launcher set `LASTDB_APP_SESSION`.
-pub fn session_header() -> Result<Option<String>, LastSeekError> {
-    match std::env::var("LASTDB_APP_SESSION") {
-        Err(_) => Ok(None),
-        Ok(value) if value.is_empty() => Ok(None),
-        Ok(value) if value.bytes().any(|byte| byte == b'\r' || byte == b'\n') => {
-            Err(invalid("LASTDB_APP_SESSION contains a line break"))
-        }
-        Ok(value) => Ok(Some(format!("X-LastDB-App-Session: {value}"))),
+/// This binary's app id. It matches `app_id` in `lastdb-app.json`. The
+/// launcher sets `LASTDB_APP` to this value.
+pub const APP_ID: &str = "lastseek";
+
+enum AppEnv {
+    /// No app id. A developer or CI run talks to the socket it named, or
+    /// the owner socket, and sends no app id.
+    Unset,
+    /// The launcher started LastSeek.
+    Own(String),
+    /// Another app started LastSeek and left its own id in the environment.
+    Foreign,
+}
+
+/// An app id is 1 to 40 characters of lowercase letters, digits, and `-`.
+fn valid_app_id(value: &str) -> bool {
+    (1..=40).contains(&value.len())
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn classify_app_env() -> Result<AppEnv, LastSeekError> {
+    match std::env::var("LASTDB_APP") {
+        Err(std::env::VarError::NotPresent) => Ok(AppEnv::Unset),
+        Err(std::env::VarError::NotUnicode(_)) => Err(invalid(
+            "LASTDB_APP must be 1 to 40 characters of lowercase letters, digits, and '-'",
+        )),
+        Ok(value) if value.is_empty() => Ok(AppEnv::Unset),
+        Ok(value) if !valid_app_id(&value) => Err(invalid(
+            "LASTDB_APP must be 1 to 40 characters of lowercase letters, digits, and '-'",
+        )),
+        Ok(value) if value == APP_ID => Ok(AppEnv::Own(value)),
+        Ok(_) => Ok(AppEnv::Foreign),
     }
+}
+
+/// `X-LastDB-App` when the launcher set `LASTDB_APP` to this app's id.
+///
+/// Unset or empty sends no header. Another app's id is not sent.
+pub fn app_header() -> Result<Option<String>, LastSeekError> {
+    match classify_app_env()? {
+        AppEnv::Own(id) => Ok(Some(format!("X-LastDB-App: {id}"))),
+        AppEnv::Unset | AppEnv::Foreign => Ok(None),
+    }
+}
+
+/// `LASTDB_SOCKET_PATH` belongs to this process when the launcher set it
+/// for LastSeek, or when no app id is set. Another app's path does not.
+pub fn honor_lastdb_socket_path() -> Result<bool, LastSeekError> {
+    Ok(!matches!(classify_app_env()?, AppEnv::Foreign))
+}
+
+/// The detached build is this same binary, so it keeps LastSeek's app id
+/// and socket. Another app's `LASTDB_APP` and `LASTDB_SOCKET_PATH` are
+/// removed. LastSeek does not start another app's command.
+pub fn retain_own_launcher_env(command: &mut Command) -> Result<(), LastSeekError> {
+    if matches!(classify_app_env()?, AppEnv::Foreign) {
+        command.env_remove("LASTDB_APP");
+        command.env_remove("LASTDB_SOCKET_PATH");
+    }
+    Ok(())
 }
 
 fn encode_query_value(value: &str) -> String {
@@ -156,7 +208,7 @@ impl Source<'_> {
             .arg("--unix-socket")
             .arg(self.0)
             .arg(url);
-        if let Some(header) = session_header()? {
+        if let Some(header) = app_header()? {
             command.args(["-H", &header]);
         }
         let mut body_bytes = None;

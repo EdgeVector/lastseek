@@ -222,9 +222,9 @@ machine down on 2026-08-07.
   --consume      DELETE each batch file after applying it.
 
 After an online rebuild, drain follows POST /v1/x/changes and --max-files caps
-the number of change events. The socket is $LASTDB_SOCKET_PATH when the
-launcher set it. A changed list id or a gap rebuilds the index. File
-consumption only applies to inbox stores.
+the number of change events. The socket is $LASTDB_SOCKET_PATH when LASTDB_APP
+is lastseek or unset. Another app's socket path is not used. A changed list
+id or a gap rebuilds the index. File consumption only applies to inbox stores.
 ",
         value_flags: &["--table", "--lastdb-socket", "--inbox", "--max-files"],
         bool_flags: &["--consume"],

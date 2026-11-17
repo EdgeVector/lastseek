@@ -358,7 +358,7 @@ fn build_foreground(app: &str, dir: &Path, schemas: &[String]) -> Result<(), Las
 
 fn run_rebuild(dir: &Path, schemas: &[String]) -> Result<(), LastSeekError> {
     let table = super::load_schema_table(&[]);
-    let socket = std::path::absolute(super::lastdb_socket(&[]))?;
+    let socket = std::path::absolute(super::lastdb_socket(&[])?)?;
     let mut embedder = super::embedder_for("fastembed/bge-small-en-v1.5")?;
     if embedder.id() != "fastembed/bge-small-en-v1.5" {
         return Err(LastSeekError::Online(
@@ -381,7 +381,7 @@ fn catch_up(
         return Ok((true, fallback));
     };
     let table = super::load_schema_table(&[]);
-    let socket = std::path::absolute(super::lastdb_socket(&[]))?;
+    let socket = std::path::absolute(super::lastdb_socket(&[])?)?;
     let drained = online::drain(
         &published.dir,
         published.checkpoint.clone(),
@@ -474,8 +474,10 @@ fn cursor_of(slot: &Path, fallback: &str) -> String {
 /// Re-exec this binary as `index --wait` in a new process group.
 ///
 /// The parent does not wait. Stdin is closed. Stdout and stderr append to
-/// `index.log`. The child inherits the environment, so `LASTDB_SOCKET_PATH`
-/// and `LASTDB_APP_SESSION` are the caller's.
+/// `index.log`. The child is LastSeek, so it keeps this app's `LASTDB_APP`
+/// and `LASTDB_SOCKET_PATH`. LastSeek starts no other app's command. If it
+/// did, that command would be started without those two, and that app's
+/// launcher would set its own. Another app's values are removed here.
 fn spawn_build(dir: &Path, app: &str, schemas: &[String]) -> Result<(), LastSeekError> {
     let exe = std::env::current_exe().map_err(|error| {
         LastSeekError::Online(format!("finding the current executable: {error}"))
@@ -486,6 +488,7 @@ fn spawn_build(dir: &Path, app: &str, schemas: &[String]) -> Result<(), LastSeek
     for schema in schemas {
         cmd.arg("--schema").arg(schema);
     }
+    lastseek::retain_own_launcher_env(&mut cmd)?;
     cmd.stdin(Stdio::null());
     let log = open_log(dir)?;
     cmd.stdout(Stdio::from(log.try_clone()?));
