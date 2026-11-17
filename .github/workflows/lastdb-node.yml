@@ -1,0 +1,61 @@
+# LastSeek's real commands against a real LastDB node: the newest nightly on a
+# fresh home. ci-required builds without the embedding model; this job builds
+# the feature-complete program and runs rebuild, drain and query.
+name: LastSeek on a LastDB node
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: lastseek-node-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+jobs:
+  node:
+    name: rebuild, drain and query on a fresh node
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      # The model never changes, so its cache key is its checksum.
+      - name: Cache the embedding model
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/lastseek-model
+          key: bge-small-en-v1.5-828e1496d7fa
+      - name: Fetch and verify the embedding model
+        run: bash scripts/ci-fetch-model.sh "$HOME/.cache/lastseek-model"
+      - name: Cache the feature-complete build
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: lastseek-neural-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+      - name: Build LastSeek with the embedding model enabled
+        run: cargo build --locked --release --features neural
+      - name: Start the latest LastDB nightly on a fresh home
+        id: lastdb
+        uses: EdgeVector/.github/lastdb-node@868977ec58c80b6ea1360d161d1492d2e97f061c
+      - name: Rebuild, drain and query through the real commands
+        run: |
+          python3 scripts/ci-lastdb-node.py \
+            --lastseek target/release/lastseek \
+            --model-dir "$HOME/.cache/lastseek-model"
+      - name: Keep the node log when the job fails
+        if: ${{ failure() && steps.lastdb.outputs.log != '' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: lastdb-node-log-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ steps.lastdb.outputs.log }}
+          retention-days: 7
