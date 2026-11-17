@@ -27,7 +27,7 @@ usage:
   lastseek add [--home DIR]           read Records as JSONL on stdin, embed, append
   lastseek compact [--home DIR]       fold the pending log into the slab
   lastseek rebuild [--home DIR]       rebuild local Brain search from live LastDB
-  lastseek drain [--home DIR] [--inbox DIR] [--max-files N] [--consume]
+  lastseek drain [--home DIR] [--lastdb-socket PATH] [--inbox DIR] [--max-files N] [--consume]
                                       apply the host's IndexChangeBatch feed
   lastseek doctor [--home DIR]
   lastseek status --coverage           add per-schema coverage (reads the node
@@ -37,15 +37,18 @@ usage:
   lastseek coverage-declare --schema S --live-records N [--source TEXT]
                                       declare how many LIVE records a schema has
 
-  --home DIR   store directory (default: $LASTSEEK_HOME or ~/.lastseek/index)
-  --table PATH resolution table (default: $LASTSEEK_SCHEMA_TABLE or
-               ~/.lastseek/schema-table.json)
+  --home DIR   store directory (default: $LASTSEEK_HOME, or
+               $LASTDB_APP_DATA/index when the launcher sets it, or
+               ~/.lastseek/index)
+  --table PATH resolution table (default: $LASTSEEK_SCHEMA_TABLE, or
+               $LASTDB_APP_DATA/schema-table.json, or ~/.lastseek/schema-table.json)
   --lastdb-socket PATH
-               LastDB Unix socket (default: $LASTSEEK_LASTDB_SOCKET,
-               $LASTDB_SOCKET, or $LASTDB_HOME/data/folddb.sock)
+               LastDB Unix socket (default: $LASTDB_SOCKET_PATH,
+               $LASTSEEK_LASTDB_SOCKET, $LASTDB_SOCKET, or
+               $LASTDB_HOME/data/folddb.sock)
   --source-counts PATH
-               declared live-record counts (default: $LASTSEEK_SOURCE_COUNTS or
-               ~/.lastseek/source-counts.json)
+               declared live-record counts (default: $LASTSEEK_SOURCE_COUNTS, or
+               $LASTDB_APP_DATA/source-counts.json, or ~/.lastseek/source-counts.json)
   --coverage-floor F
                minimum vectors/source ratio for healthy (default: 0.95)
   --inbox DIR  host batch feed (default: $LASTSEEK_INBOX or
@@ -66,9 +69,14 @@ A store names its own embedder, so LASTSEEK_EMBEDDER is an OVERRIDE, not a
 requirement: querying a store built with bge-small-en-v1.5 loads that model
 without being told. Only a fresh, unbound store needs telling. `bge` loads
 bge-small-en-v1.5 from $LASTSEEK_MODEL_DIR, else
-~/.lastseek/models/bge-small-en-v1.5, else the install's
+$LASTDB_APP_DATA/models/bge-small-en-v1.5 when that directory holds the model,
+else ~/.lastseek/models/bge-small-en-v1.5, else the install's
 share/lastseek/models/bge-small-en-v1.5 (the Homebrew formula puts it there),
 and requires a build with `--features neural`.
+
+The online drain follows POST /v1/x/changes and reads records with POST /v1/read.
+It sends X-LastDB-App-Session when LASTDB_APP_SESSION is set. `lastseek rebuild`
+still lists keys with GET /api/list on the owner socket.
 ";
 
 fn home(args: &[String]) -> std::path::PathBuf {
@@ -79,6 +87,9 @@ fn home(args: &[String]) -> std::path::PathBuf {
     }
     if let Ok(v) = std::env::var("LASTSEEK_HOME") {
         return v.into();
+    }
+    if let Some(data) = lastseek::app_data_dir() {
+        return data.join("index");
     }
     let base = std::env::var("HOME").unwrap_or_else(|_| ".".into());
     std::path::Path::new(&base).join(".lastseek").join("index")
@@ -195,6 +206,11 @@ fn lastdb_socket(args: &[String]) -> std::path::PathBuf {
     if let Some(path) = flag_value(args, "--lastdb-socket") {
         return path.into();
     }
+    if let Ok(path) = std::env::var("LASTDB_SOCKET_PATH") {
+        if !path.is_empty() {
+            return path.into();
+        }
+    }
     if let Ok(path) = std::env::var("LASTSEEK_LASTDB_SOCKET") {
         return path.into();
     }
@@ -219,19 +235,22 @@ fn fetch_lastdb_catalog(args: &[String]) -> Result<(Vec<u8>, String), LastSeekEr
     let socket = lastdb_socket(args);
     let socket_text = socket.to_string_lossy().to_string();
     let url = "http://localhost/api/schemas?include_counts=true";
-    let out = std::process::Command::new("curl")
-        .args([
-            "-sS",
-            "--fail",
-            "-m",
-            "180",
-            "-H",
-            "X-LastDB-Client: lastseek",
-            "--unix-socket",
-            &socket_text,
-            url,
-        ])
-        .output()?;
+    let mut command = std::process::Command::new("curl");
+    command.args([
+        "-sS",
+        "--fail",
+        "-m",
+        "180",
+        "-H",
+        "X-LastDB-Client: lastseek",
+        "--unix-socket",
+        &socket_text,
+        url,
+    ]);
+    if let Some(header) = lastseek::session_header()? {
+        command.args(["-H", &header]);
+    }
+    let out = command.output()?;
     if !out.status.success() {
         return Err(LastSeekError::Embedder(format!(
             "fetching LastDB catalog over {}: curl exited {:?}: {}",
@@ -629,6 +648,10 @@ fn run() -> Result<(), LastSeekError> {
                             &args, &dir,
                         )?)?,
                     };
+                    let applied_through = match checkpoint {
+                        Some(checkpoint) => checkpoint.cursor(),
+                        None => mark.applied_through.clone(),
+                    };
                     let out = serde_json::json!({
                         "ok": true,
                         "state": if needs_rebuild { "rebuild_required" } else { state },
@@ -643,7 +666,7 @@ fn run() -> Result<(), LastSeekError> {
                         "timeout_count": query_metrics.timeout_count,
                         "callers": query_metrics.callers,
                         "last_drain": serde_json::to_value(metrics::last_drain(&dir))?,
-                        "applied_through": checkpoint.map_or(mark.applied_through.as_str(), |checkpoint| checkpoint.cursor()),
+                        "applied_through": applied_through,
                         "files_applied": mark.files_applied,
                         "queue": match queue {
                             Some(q) => serde_json::to_value(q)?,
@@ -810,19 +833,21 @@ fn run() -> Result<(), LastSeekError> {
                     return Err(LastSeekError::Online("--max-files must be positive".into()));
                 }
                 let mut embedder = embedder_for(VectorStore::open(&dir)?.embedder_id())?;
+                let socket = std::path::absolute(lastdb_socket(&args))?;
                 let attempt = lastseek::online::drain(
                     &dir,
                     checkpoint.clone(),
+                    &socket,
                     &table,
                     embedder.as_mut(),
                     max,
                 );
                 let result = match attempt {
-                    Err(LastSeekError::OnlineFeedGap) => {
+                    Err(LastSeekError::OnlineFeedGap | LastSeekError::ChangesListReplaced) => {
                         // The rebuild needs the exclusive publication lock.
                         // Release this selection while retaining the drain lock.
                         drop(selection);
-                        lastseek::online::recover(&root, &table, embedder.as_mut())?
+                        lastseek::online::recover(&root, &socket, &table, embedder.as_mut())?
                     }
                     result => result?,
                 };

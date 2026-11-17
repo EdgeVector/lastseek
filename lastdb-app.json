@@ -1,6 +1,6 @@
 {
   "app_id": "lastseek",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "source": "https://github.com/EdgeVector/lastseek.git",
   "metadata": {
     "display_name": "lastseek",
@@ -12,6 +12,23 @@
     "entrypoint": "dist/lastseek"
   },
   "schemas": [],
+  "access": {
+    "read": [
+      "brain/Design",
+      "brain/Task",
+      "brain/Concept",
+      "brain/Preference",
+      "brain/Reference",
+      "brain/Agent",
+      "brain/Project",
+      "brain/Spike",
+      "brain/Sop",
+      "brain/Decision",
+      "brain/BrainAttachmentIndex"
+    ],
+    "write": [],
+    "extensions": ["changes"]
+  },
   "outbox_format_version": 1,
   "install": {
     "prepare": [

@@ -13,14 +13,26 @@ pub mod embed;
 pub mod index;
 pub mod ingest;
 mod live_source;
+pub use live_source::session_header;
 pub mod metrics;
 pub mod online;
 pub mod schema;
+mod search_catalog;
 pub mod search_queue;
 pub mod source_counts;
 pub mod store;
 
+use std::path::PathBuf;
 use thiserror::Error;
+
+/// App data directory the launcher names. Empty is the same as unset.
+pub fn app_data_dir() -> Option<PathBuf> {
+    let value = std::env::var_os("LASTDB_APP_DATA")?;
+    if value.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(value))
+}
 
 #[derive(Debug, Error)]
 pub enum LastSeekError {
@@ -28,6 +40,10 @@ pub enum LastSeekError {
     Online(String),
     #[error("the LastDB change feed has a gap; the online drain can rebuild the index")]
     OnlineFeedGap,
+    #[error(
+        "the LastDB changes list changed; the saved position is void and the index must be rebuilt"
+    )]
+    ChangesListReplaced,
     #[error("Search rebuild required: LastDB stopped the change feed after Search was disabled or its queue reached the limit. Rebuild a fresh LastSeek store from all current LastDB records before the owner clears .rebuild-required; database writes continue.")]
     SearchRebuildRequired,
     #[error("io: {0}")]

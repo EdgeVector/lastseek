@@ -1,20 +1,25 @@
 # LastSeek
 
-For local Brain records, rebuild the index while LastDB is running:
+For local Brain records, rebuild the index while LastDB is running. Rebuild
+lists keys on the owner socket (`GET /api/list`). The app socket cannot list
+keys, and `POST /v1/x/changes` from `after: 0` does not yield every live key:
+LastDB keeps the newest 250,000 change entries and sets `gap` once an older
+entry is dropped.
 
 ```sh
 lastseek rebuild
 ```
 
-LastSeek lists primary keys, reads the current records in batches, and catches
-up on LastDB's durable app change feed. It builds the replacement separately
-and publishes the vectors and feed cursor together. The existing `lastseek
-drain` command then follows that cursor, including updates and deletions.
-After LastDB restarts, the drain checks the saved cursor's mutation ID and
-continues from that cursor when it matches. A gap or an unverifiable cursor
-starts a replacement index while LastDB stays online. A socket failure can
-be retried from the same checkpoint. Changed searchable schema definitions
-require an explicit rebuild. `lastseek status` reports the saved anchor,
+LastSeek lists primary keys, reads the current records with `POST /v1/read`
+(up to 64 keys at a time), and catches up on `POST /v1/x/changes`. It builds
+the replacement separately and publishes the vectors and the changes position
+(`through`, plus the list `id`) together. The existing `lastseek drain`
+command then follows that position, including updates and deletions. A changed
+list `id` voids the position. A gap, or a changed `id`, starts a replacement
+index while LastDB stays online. That replacement still needs the owner
+socket's key listing. A socket failure can be retried from the same
+checkpoint. The searchable fields come from `searchable-schemas.json` in this
+repo, not from `GET /api/schemas`. `lastseek status` reports the list id,
 resumed restarts and completed gap rebuilds for the online store.
 
 This workflow covers searchable Brain schemas and ordinary local writes.
@@ -328,9 +333,16 @@ model goes under the formula's pkgshare,
 separate download is needed. `lastseek` looks for the model in this order:
 
 1. `$LASTSEEK_MODEL_DIR`, when set (an explicit override).
-2. `~/.lastseek/models/bge-small-en-v1.5`, when it holds `model.onnx`.
-3. `share/lastseek/models/bge-small-en-v1.5` next to the installed binary
+2. `$LASTDB_APP_DATA/models/bge-small-en-v1.5`, when the launcher set that
+   directory and it holds `model.onnx`.
+3. `~/.lastseek/models/bge-small-en-v1.5`, when app data is unset and the
+   directory holds `model.onnx`.
+4. `share/lastseek/models/bge-small-en-v1.5` next to the installed binary
    (the Homebrew location).
+
+When `LASTDB_APP_DATA` is set, the index, changes cursor, schema table and
+declared counts default to that directory. Without it, they stay under
+`~/.lastseek`.
 
 The public binaries are licensed under Apache-2.0 (see `LICENSE`). Bundled
 third-party code is listed in `THIRD_PARTY_NOTICES`. The source is public under the same license.

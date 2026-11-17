@@ -3,11 +3,12 @@
 use crate::embed::Embedder;
 use crate::ingest::{Batch, IndexChange, KeyValue};
 use crate::live_source::{
-    changed_keys, invalid, FeedPage, FeedPosition, Key, Projection, Source, SourceIdentity,
-    FEED_PAGE, KEY_PAGE,
+    changed_keys, invalid, page_break, FeedPage, FeedPosition, Key, Projection, Source,
+    SourceIdentity, FEED_PAGE, READ_BATCH,
 };
 use crate::metrics::{self, LastDrain};
 use crate::schema::SchemaTable;
+use crate::search_catalog;
 use crate::store::{
     create_private_dir_all, private_open_options, sync_dir, write_private_atomic, PendingOp,
     VectorStore,
@@ -51,6 +52,7 @@ struct Recovery {
 enum Block {
     FeedGap,
     SchemaChanged,
+    ListChanged,
 }
 
 impl Block {
@@ -58,6 +60,7 @@ impl Block {
         match self {
             Self::FeedGap => LastSeekError::OnlineFeedGap,
             Self::SchemaChanged => invalid("searchable schemas changed; run lastseek rebuild"),
+            Self::ListChanged => LastSeekError::ChangesListReplaced,
         }
     }
 }
@@ -67,13 +70,13 @@ impl Checkpoint {
         self.needs_rebuild
     }
 
-    pub fn cursor(&self) -> &str {
-        &self.position.cursor
+    pub fn cursor(&self) -> String {
+        self.position.through.to_string()
     }
 
     pub fn recovery_status(&self) -> Value {
         json!({
-            "anchored": self.position.anchor.is_some(),
+            "list_id": self.source.id,
             "resumed_restarts": self.recovery.resumed_restarts,
             "gap_rebuilds": self.recovery.gap_rebuilds,
             "blocked_by": self.recovery.blocked_by,
@@ -228,7 +231,7 @@ impl Importer<'_> {
         keys: &[Key],
     ) -> Result<Vec<PendingOp>, LastSeekError> {
         let mut ops = Vec::new();
-        for keys in keys.chunks(KEY_PAGE) {
+        for keys in keys.chunks(READ_BATCH) {
             let mut rows = self.source.records(schema, keys, projection)?;
             let batch = Batch {
                 schema_name: schema.to_owned(),
@@ -300,16 +303,20 @@ impl Importer<'_> {
         &mut self,
         page: &FeedPage,
         projections: &BTreeMap<String, Projection>,
-        boot: &SourceIdentity,
+        list_id: &str,
     ) -> Result<Applied, LastSeekError> {
+        let schema_names: Vec<String> = projections.keys().cloned().collect();
         let mut ops = Vec::new();
         for (schema, keys) in changed_keys(page, projections)? {
             let keys: Vec<_> = keys.into_iter().collect();
             ops.extend(self.read_ops(&schema, &projections[&schema], &keys)?);
         }
-        // A restart between the feed read and hydration must not append
-        // records from a different source to the active generation.
-        self.source.require_boot(boot)?;
+        // A restore between the feed read and hydration must not append
+        // records from a different changes list to the active generation.
+        let check = self.source.changes_head(&schema_names)?;
+        if check.id != list_id {
+            return Err(LastSeekError::ChangesListReplaced);
+        }
         self.apply(&ops)
     }
 }
@@ -338,6 +345,7 @@ pub fn rebuild(
 
 pub fn recover(
     root: &Path,
+    socket: &Path,
     table: &SchemaTable,
     embedder: &mut dyn Embedder,
 ) -> Result<Value, LastSeekError> {
@@ -354,7 +362,7 @@ pub fn recover(
     }
     rebuild_locked(
         root,
-        &state.socket,
+        socket,
         &state.names,
         table,
         embedder,
@@ -374,18 +382,17 @@ fn rebuild_locked(
 ) -> Result<Value, LastSeekError> {
     let started = Instant::now();
     let source = Source(socket);
-    let identity = source.identity()?;
-    let projections = source.projections(names, table)?;
+    let projections = search_catalog::projections(names, table)?;
     if previous_projections.is_some_and(|previous| *previous != projections) {
         return Err(invalid("searchable schemas changed; run lastseek rebuild"));
     }
-    if projections.is_empty() || names.iter().any(|name| !projections.contains_key(name)) {
-        return Err(invalid(
-            "rebuild requires available, explicitly searchable local Brain schemas",
-        ));
-    }
     require_scope(&select(root)?.dir, &projections)?;
-    let mut position = source.head()?;
+    let schema_names: Vec<String> = projections.keys().cloned().collect();
+    // Head only. `after: 0` sets gap once retention has trimmed the list, and
+    // that gap does not remove the current head.
+    let opening = source.changes_head(&schema_names)?;
+    let list_id = opening.id.clone();
+    let mut position = opening.head;
 
     let control = root.join(ONLINE);
     let slot = if active(root)? == Some("a") { "b" } else { "a" };
@@ -429,16 +436,26 @@ fn rebuild_locked(
                 }
             }
         }
+        let saved = SourceIdentity {
+            id: list_id.clone(),
+        };
         loop {
             within_budget(started)?;
-            let page = importer.source.changes(Some(&position.cursor), FEED_PAGE)?;
+            let page = importer
+                .source
+                .changes(position, FEED_PAGE, &schema_names)?;
+            if page_break(&page, &saved).is_some() {
+                return Err(invalid(
+                    "LastDB changes list changed during the build; retry the rebuild",
+                ));
+            }
             feed_events += page.changes.len();
-            tail.include(importer.replay(&page, &projections, &identity)?);
-            position = page.position(Some(&position));
+            tail.include(importer.replay(&page, &projections, &list_id)?);
+            position = page.through;
             if importer.store.pending_ops() >= COMPACT_AT {
                 importer.store.compact()?;
             }
-            if !page.has_more {
+            if page.caught_up() {
                 break;
             }
         }
@@ -446,25 +463,27 @@ fn rebuild_locked(
     store.compact()?;
     let committed = store.committed_rows();
     let source = Source(socket);
-    if source.identity()? != identity || source.projections(names, table)? != projections {
+    let saved = SourceIdentity {
+        id: list_id.clone(),
+    };
+    // Verify the next page is still available after compaction. Later changes
+    // remain for drain, which starts at the exact published position.
+    let check = source.changes(position, 1, &schema_names)?;
+    if page_break(&check, &saved).is_some() {
         return Err(invalid(
-            "LastDB or its searchable schemas changed during the build; retry the rebuild",
+            "LastDB changes list changed during the build; retry the rebuild",
         ));
     }
-    // Verify the next page is still available after compaction. Later changes
-    // remain for drain, which starts at the exact published cursor.
-    source.changes(Some(&position.cursor), 1)?;
-    source.require_boot(&identity)?;
     recovery.blocked_by = None;
     if previous_projections.is_some() {
         recovery.gap_rebuilds = recovery.gap_rebuilds.saturating_add(1);
     }
     let checkpoint = Checkpoint {
         socket: socket.to_owned(),
-        source: identity,
-        names: names.to_vec(),
+        source: saved,
+        names: schema_names,
         projections,
-        position,
+        position: FeedPosition { through: position },
         needs_rebuild: false,
         recovery,
     };
@@ -487,34 +506,19 @@ fn rebuild_locked(
 pub fn drain(
     dir: &Path,
     mut checkpoint: Checkpoint,
+    socket: &Path,
     table: &SchemaTable,
     embedder: &mut dyn Embedder,
     mut remaining_budget: usize,
 ) -> Result<Value, LastSeekError> {
     checkpoint.require_ready()?;
-    let socket = checkpoint.socket.clone();
-    let source = Source(&socket);
-    let identity = source.identity()?;
-    let projections = source.projections(&checkpoint.names, table)?;
-    let restarted = identity != checkpoint.source;
-    let observed_anchor = if restarted || checkpoint.position.anchor.is_none() {
-        source.anchor_at(checkpoint.cursor())?
-    } else {
-        None
-    };
-    source.require_boot(&identity)?;
+    checkpoint.socket = socket.to_owned();
+    let source = Source(socket);
+    let projections = search_catalog::projections(&checkpoint.names, table)?;
     if projections != checkpoint.projections {
         return Err(checkpoint.block(dir, Block::SchemaChanged)?);
     }
-    if restarted {
-        if observed_anchor.is_none() || observed_anchor != checkpoint.position.anchor {
-            return Err(checkpoint.block(dir, Block::FeedGap)?);
-        }
-    } else if checkpoint.position.anchor.is_none() {
-        // Existing checkpoints acquire an anchor while their original daemon
-        // is still serving. Across a restart an unsigned cursor is ambiguous.
-        checkpoint.position.anchor = observed_anchor;
-    }
+    let schema_names: Vec<String> = projections.keys().cloned().collect();
     let mut store = VectorStore::open(dir)?;
     store.bind_embedder(embedder)?;
     let mut importer = Importer {
@@ -527,26 +531,32 @@ pub fn drain(
     let mut events = 0;
     let mut has_more = true;
     while remaining_budget > 0 && has_more {
-        let page = match importer
-            .source
-            .changes(Some(checkpoint.cursor()), remaining_budget.min(FEED_PAGE))
-        {
-            Err(LastSeekError::OnlineFeedGap) => {
-                importer.source.require_boot(&identity)?;
-                return Err(checkpoint.block(dir, Block::FeedGap)?);
-            }
-            result => result?,
-        };
-        applied.include(importer.replay(&page, &checkpoint.projections, &identity)?);
-        remaining_budget = remaining_budget.saturating_sub(page.changes.len());
-        events += page.changes.len();
-        has_more = page.has_more;
-        if checkpoint.source != identity {
-            checkpoint.recovery.resumed_restarts =
-                checkpoint.recovery.resumed_restarts.saturating_add(1);
-            checkpoint.source = identity.clone();
+        let after = checkpoint.position.through;
+        let page =
+            importer
+                .source
+                .changes(after, remaining_budget.min(FEED_PAGE), &schema_names)?;
+        if let Some(error) = page_break(&page, &checkpoint.source) {
+            let reason = match error {
+                LastSeekError::ChangesListReplaced => Block::ListChanged,
+                _ => Block::FeedGap,
+            };
+            return Err(checkpoint.block(dir, reason)?);
         }
-        checkpoint.position = page.position(Some(&checkpoint.position));
+        match importer.replay(&page, &checkpoint.projections, &checkpoint.source.id) {
+            Err(LastSeekError::ChangesListReplaced) => {
+                return Err(checkpoint.block(dir, Block::ListChanged)?);
+            }
+            result => applied.include(result?),
+        }
+        let advanced = page.changes.len();
+        // A page of other schemas still moves `through`. Count it so the cap
+        // bounds the walk when none of our schemas changed.
+        let consumed = if advanced == 0 { 1 } else { advanced };
+        remaining_budget = remaining_budget.saturating_sub(consumed);
+        events += advanced;
+        has_more = !page.caught_up();
+        checkpoint.position.through = page.through;
         checkpoint.save(dir)?;
     }
     let compacted = store.pending_ops() >= COMPACT_AT;

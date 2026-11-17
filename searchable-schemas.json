@@ -1,0 +1,48 @@
+{
+  "schemas": [
+    {
+      "name": "brain/Design",
+      "fields": ["knowledge_record_title", "knowledge_record_markdown"]
+    },
+    {
+      "name": "brain/Task",
+      "fields": ["knowledge_record_title", "knowledge_record_markdown"]
+    },
+    {
+      "name": "brain/Concept",
+      "fields": ["knowledge_record_title", "knowledge_record_markdown"]
+    },
+    {
+      "name": "brain/Preference",
+      "fields": ["knowledge_record_title", "knowledge_record_markdown"]
+    },
+    {
+      "name": "brain/Reference",
+      "fields": ["knowledge_record_title", "knowledge_record_markdown"]
+    },
+    {
+      "name": "brain/Agent",
+      "fields": ["knowledge_record_title", "knowledge_record_markdown"]
+    },
+    {
+      "name": "brain/Project",
+      "fields": ["knowledge_record_title", "knowledge_record_markdown"]
+    },
+    {
+      "name": "brain/Spike",
+      "fields": ["knowledge_record_title", "knowledge_record_markdown"]
+    },
+    {
+      "name": "brain/Sop",
+      "fields": ["knowledge_record_title", "knowledge_record_markdown"]
+    },
+    {
+      "name": "brain/Decision",
+      "fields": ["knowledge_record_title", "knowledge_record_markdown"]
+    },
+    {
+      "name": "brain/BrainAttachmentIndex",
+      "fields": ["attachment_file_names"]
+    }
+  ]
+}

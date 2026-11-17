@@ -35,32 +35,42 @@ pub const BGE_MODEL_DIR_NAME: &str = "bge-small-en-v1.5";
 /// order is testable without touching the real environment.
 ///
 /// 1. `LASTSEEK_MODEL_DIR`, when set, wins outright.
-/// 2. `$HOME/.lastseek/models/bge-small-en-v1.5`, when it holds `model.onnx`.
-/// 3. `<canonical exe dir>/../share/lastseek/models/bge-small-en-v1.5`, when it
+/// 2. `$LASTDB_APP_DATA/models/bge-small-en-v1.5`, when the launcher set that
+///    directory and it holds `model.onnx`.
+/// 3. `$HOME/.lastseek/models/bge-small-en-v1.5`, when app data is unset and
+///    the directory holds `model.onnx`.
+/// 4. `<canonical exe dir>/../share/lastseek/models/bge-small-en-v1.5`, when it
 ///    holds `model.onnx`. This is the Homebrew layout: the formula installs the
 ///    binary at `Cellar/lastseek/<v>/bin/lastseek` and the model under its
 ///    pkgshare, `Cellar/lastseek/<v>/share/lastseek/models/...`. The exe path
 ///    is canonicalized first because `/opt/homebrew/bin/lastseek` is a
 ///    symlink into the Cellar.
-/// 4. Otherwise the `$HOME` path from step 2, so the load error names the
-///    documented default location.
+/// 5. Otherwise the app-data path, or the `$HOME` path, so the load error
+///    names the default location.
 ///
 /// Not gated on the `neural` feature: the resolution is pure path logic and
 /// the required CI gate (which never builds `neural`) must test it.
 pub fn resolve_model_dir(
     env_model_dir: Option<std::ffi::OsString>,
+    app_data: Option<std::path::PathBuf>,
     home: Option<std::ffi::OsString>,
     current_exe: Option<std::path::PathBuf>,
 ) -> std::path::PathBuf {
     if let Some(v) = env_model_dir.filter(|v| !v.is_empty()) {
         return v.into();
     }
+    let app_dir = app_data.map(|dir| dir.join("models").join(BGE_MODEL_DIR_NAME));
+    if let Some(dir) = app_dir.as_ref() {
+        if dir.join("model.onnx").is_file() {
+            return dir.clone();
+        }
+    }
     let base = home.unwrap_or_else(|| ".".into());
     let home_dir = std::path::Path::new(&base)
         .join(".lastseek")
         .join("models")
         .join(BGE_MODEL_DIR_NAME);
-    if home_dir.join("model.onnx").is_file() {
+    if app_dir.is_none() && home_dir.join("model.onnx").is_file() {
         return home_dir;
     }
     if let Some(dir) = current_exe.and_then(|exe| install_share_model_dir(&exe)) {
@@ -68,7 +78,7 @@ pub fn resolve_model_dir(
             return dir;
         }
     }
-    home_dir
+    app_dir.unwrap_or(home_dir)
 }
 
 /// `<canonical exe dir>/../share/lastseek/models/bge-small-en-v1.5`, or `None`
@@ -115,6 +125,7 @@ impl BgeSmallEmbedder {
     pub fn default_model_dir() -> std::path::PathBuf {
         resolve_model_dir(
             std::env::var_os("LASTSEEK_MODEL_DIR"),
+            crate::app_data_dir(),
             std::env::var_os("HOME"),
             std::env::current_exe().ok(),
         )

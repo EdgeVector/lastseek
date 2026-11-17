@@ -106,6 +106,9 @@ impl SourceCounts {
         if let Ok(v) = std::env::var("LASTSEEK_SOURCE_COUNTS") {
             return v.into();
         }
+        if let Some(data) = crate::app_data_dir() {
+            return data.join("source-counts.json");
+        }
         let base = std::env::var("HOME").unwrap_or_else(|_| ".".into());
         Path::new(&base)
             .join(".lastseek")
