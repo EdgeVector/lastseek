@@ -16,17 +16,25 @@ use lastseek::store::{PendingOp, Record, VectorStore};
 use lastseek::LastSeekError;
 use std::io::Read;
 
+mod app_cmd;
+
 const USAGE: &str = "\
 lastseek — memory-mapped semantic vector search for LastDB
 
 usage:
   lastseek --version | -V             print `lastseek <version>`
+  lastseek index  --app NAME --schema S [--schema S]... [--wait]
+                                      name an app's schemas and build its index
+  lastseek search --app NAME <text> [--schema S]... [--k N] [--min-score F]
+                                      answer from that app's index
+  lastseek status --app NAME          absent, building, ready, failed, or
+                                      rebuild_required
   lastseek status [--home DIR]
   lastseek query <text> [--home DIR] [--k N] [--schema S]... [--min-score F] [--caller C]
                                       answers keys + scores; bodies stay in LastDB
   lastseek add [--home DIR]           read Records as JSONL on stdin, embed, append
   lastseek compact [--home DIR]       fold the pending log into the slab
-  lastseek rebuild [--home DIR]       rebuild local Brain search from live LastDB
+  lastseek rebuild [--home DIR]       rebuild one directory from live LastDB
   lastseek drain [--home DIR] [--lastdb-socket PATH] [--inbox DIR] [--max-files N] [--consume]
                                       apply the host's IndexChangeBatch feed
   lastseek doctor [--home DIR]
@@ -37,8 +45,14 @@ usage:
   lastseek coverage-declare --schema S --live-records N [--source TEXT]
                                       declare how many LIVE records a schema has
 
-  --home DIR   store directory (default: $LASTSEEK_HOME, or
-               $LASTDB_APP_DATA/index when the launcher sets it, or
+`index`, `search`, and `status --app` print one JSON object on stdout.
+They do not take `--home`. The index is $LASTSEEK_HOME/apps/NAME, or
+~/.lastseek/apps/NAME. LASTDB_APP_DATA does not move it. `index` returns
+as soon as a build is running unless `--wait` is given. `search` does not
+start a first build.
+
+  --home DIR   store directory for the older commands (default: $LASTSEEK_HOME,
+               or $LASTDB_APP_DATA/index when the launcher sets it, or
                ~/.lastseek/index)
   --table PATH resolution table (default: $LASTSEEK_SCHEMA_TABLE, or
                $LASTDB_APP_DATA/schema-table.json, or ~/.lastseek/schema-table.json)
@@ -100,34 +114,6 @@ fn flag_value(args: &[String], name: &str) -> Option<String> {
         .position(|a| a == name)
         .and_then(|i| args.get(i + 1))
         .cloned()
-}
-
-/// A published Brain index serves its own explicit schema scopes. Explicit
-/// stores and inboxes keep their original meaning for all callers.
-fn brain_query_index(
-    args: &[String],
-    root: &std::path::Path,
-) -> Result<Option<lastseek::online::Selection>, LastSeekError> {
-    if flag_value(args, "--home").is_some()
-        || std::env::var_os("LASTSEEK_HOME").is_some()
-        || flag_value(args, "--inbox").is_some()
-    {
-        return Ok(None);
-    }
-    let schemas = flag_values(args, "--schema");
-    if schemas.is_empty() || schemas.iter().any(|schema| !schema.starts_with("brain/")) {
-        return Ok(None);
-    }
-    let brain_root = root.with_file_name("brain-index");
-    if !brain_root.is_dir() {
-        return Ok(None);
-    }
-    let selected = lastseek::online::select(&brain_root)?;
-    Ok(selected
-        .checkpoint
-        .as_ref()
-        .is_some_and(|state| state.covers(&schemas))
-        .then_some(selected))
 }
 
 /// Parse a flag's value as `T`, erroring on a present-but-malformed value
@@ -380,6 +366,16 @@ fn run() -> Result<(), LastSeekError> {
         lastseek::cli::Invocation::Run => {}
     }
 
+    // The app commands own their directory. Resolve it before `home()`, which
+    // follows LASTDB_APP_DATA and would otherwise point at a different index
+    // for every caller.
+    if cmd == "index"
+        || cmd == "search"
+        || (cmd == "status" && flag_value(&args, "--app").is_some())
+    {
+        return app_cmd::run(&args);
+    }
+
     let root = home(&args);
     if cmd == "rebuild" {
         let table = load_schema_table(&args);
@@ -403,19 +399,12 @@ fn run() -> Result<(), LastSeekError> {
     let _updates = matches!(cmd.as_str(), "drain" | "compact" | "add")
         .then(|| lastseek::online::lock_updates(&root))
         .transpose()?;
-    let selection = if cmd == "query" {
-        match brain_query_index(&args, &root)? {
-            Some(selected) => Some(selected),
-            None => Some(lastseek::online::select(&root)?),
-        }
-    } else {
-        matches!(
-            cmd.as_str(),
-            "status" | "doctor" | "drain" | "compact" | "add" | "coverage-declare"
-        )
-        .then(|| lastseek::online::select(&root))
-        .transpose()?
-    };
+    let selection = matches!(
+        cmd.as_str(),
+        "query" | "status" | "doctor" | "drain" | "compact" | "add" | "coverage-declare"
+    )
+    .then(|| lastseek::online::select(&root))
+    .transpose()?;
     let dir = selection
         .as_ref()
         .map_or_else(|| root.clone(), |selected| selected.dir.clone());

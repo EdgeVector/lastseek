@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
-"""Run the real LastSeek commands against a running LastDB node.
+"""Run the LastSeek app commands against a running LastDB node.
 
 The node is a fresh generated home that the `lastdb-node` CI action started.
 This script declares two schemas, writes records, and then runs
-`lastseek rebuild`, `lastseek drain` and `lastseek query` the way a user does.
-It fails when an indexed record is not found, when a deleted record still
-answers, or when a record of a schema nobody named appears.
+`lastseek index`, `lastseek status` and `lastseek search`. It fails when the
+first index does not return at once with `building`, when status does not
+reach `ready`, when a search misses an indexed record, when a deleted record
+still answers, when a record of a schema nobody named appears, or when a
+second index of the same schemas rebuilds anything.
 """
 
 from __future__ import annotations
@@ -19,9 +21,14 @@ import socket
 import subprocess
 import sys
 import tempfile
+import time
 
 NAMED, UNNAMED = "SeekNote", "SeekPrivate"
+APP = "harbour"
 FIELDS = ["title", "body"]
+INDEX_RETURN_S = 30
+READY_DEADLINE_S = 600
+FAILED_GRACE_S = 15
 
 
 class UnixConnection(http.client.HTTPConnection):
@@ -83,29 +90,85 @@ def revision(node: str, key: str) -> str:
 
 class LastSeek:
     def __init__(self, program: Path, home: Path, node: str, model: Path):
-        self.program, self.home, self.node = program, home, node
+        self.program = program
+        self.home = home
+        self.app_dir = home / "apps" / APP
         self.environment = {key: value for key, value in os.environ.items()
                             if not key.startswith(("LASTSEEK", "LASTDB"))}
-        self.environment.update(LASTSEEK_MODEL_DIR=str(model), LASTSEEK_EMBEDDER="bge")
+        # LASTDB_APP_DATA points somewhere else on purpose. The app index must
+        # stay under LASTSEEK_HOME/apps and must not follow the caller's data.
+        self.environment.update(
+            LASTSEEK_HOME=str(home),
+            LASTSEEK_MODEL_DIR=str(model),
+            LASTSEEK_EMBEDDER="bge",
+            LASTDB_SOCKET_PATH=node,
+            LASTDB_APP_DATA=str(home.parent / "lastdb-app-data"),
+        )
 
-    def run(self, *arguments: str) -> dict:
-        done = subprocess.run([str(self.program), *arguments, "--home", str(self.home)],
-                              env=self.environment, capture_output=True, text=True, timeout=900)
-        if done.returncode != 0:
-            fail(f"lastseek {arguments[0]} exited {done.returncode}: {done.stderr[-800:]}")
-        return json.loads(done.stdout)
-
-    def keys(self, text: str) -> list[str]:
-        reply = self.run("query", text, "--schema", NAMED, "--k", "5")
-        return [hit["key_hash"] for hit in reply["results"]]
+    def run(self, *arguments: str, check: bool = True, timeout: float = 900):
+        started = time.monotonic()
+        done = subprocess.run(
+            [str(self.program), *arguments],
+            env=self.environment,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+        )
+        elapsed = time.monotonic() - started
+        reply = None
+        if done.stdout.strip():
+            try:
+                reply = json.loads(done.stdout)
+            except json.JSONDecodeError:
+                if check:
+                    fail(f"lastseek {arguments[0]} stdout was not one JSON object: "
+                         f"{done.stdout[:400]!r}\n{done.stderr[-400:]}")
+        if check and done.returncode != 0:
+            fail(f"lastseek {' '.join(arguments)} exited {done.returncode} "
+                 f"after {elapsed:.1f}s: {done.stderr[-800:]}\nstdout {done.stdout[:400]!r}")
+        if check and not isinstance(reply, dict):
+            fail(f"lastseek {arguments[0]} printed no JSON object: {done.stdout[:400]!r}")
+        return done, reply, elapsed
 
 
 def expect_first(seek: LastSeek, text: str, key: str) -> None:
-    found = seek.keys(text)
+    found = seek_keys(seek, text)
     if not found or found[0] != key:
-        fail(f"the query {text!r} should rank {key} first, got {found}")
+        fail(f"the search {text!r} should rank {key} first, got {found}")
     if "vault" in found:
         fail("a record of a schema nobody named is in the index")
+
+
+def seek_keys(seek: LastSeek, text: str) -> list[str]:
+    _done, reply, _elapsed = seek.run(
+        "search", "--app", APP, text, "--schema", NAMED, "--k", "5")
+    return [hit["key_hash"] for hit in reply["results"]]
+
+
+def wait_ready(seek: LastSeek) -> dict:
+    deadline = time.monotonic() + READY_DEADLINE_S
+    failed_since = None
+    last = None
+    while True:
+        _done, reply, _elapsed = seek.run("status", "--app", APP, timeout=60)
+        last = reply
+        state = reply.get("state")
+        if state == "ready":
+            return reply
+        now = time.monotonic()
+        if state not in ("building", "failed"):
+            fail(f"status left the build path: {reply!r}")
+        if state == "failed":
+            failed_since = failed_since or now
+            if now - failed_since > FAILED_GRACE_S:
+                log = seek.app_dir / "index.log"
+                tail = log.read_text(errors="replace")[-1500:] if log.exists() else ""
+                fail(f"the build failed: {reply!r}\n{tail}")
+        else:
+            failed_since = None
+        if now > deadline:
+            fail(f"status did not reach ready within {READY_DEADLINE_S}s, last {last!r}")
+        time.sleep(2)
 
 
 def main() -> None:
@@ -127,33 +190,79 @@ def main() -> None:
     write(node, {**record(UNNAMED, "vault", "Sourdough loaf", "Bake the loaf of bread from the sourdough starter."), "op": "create"})
 
     with tempfile.TemporaryDirectory(prefix="lastseek-ci-") as scratch:
-        seek = LastSeek(arguments.lastseek.resolve(), Path(scratch) / "index", node, arguments.model_dir.resolve())
-        built = seek.run("rebuild", "--lastdb-socket", node, "--schema", NAMED)
-        if built["indexed"]["records"] != 3 or built["schemas"] != [NAMED]:
-            fail(f"the rebuild should index the three {NAMED} records, got {built!r}")
+        home = Path(scratch) / "lastseek-home"
+        home.mkdir()
+        seek = LastSeek(arguments.lastseek.resolve(), home, node, arguments.model_dir.resolve())
+
+        never, never_reply, _elapsed = seek.run(
+            "search", "--app", "never", "how do I bake bread", check=False, timeout=60)
+        if never.returncode != 3 or not isinstance(never_reply, dict) \
+                or never_reply.get("code") != "index_not_ready" \
+                or never_reply.get("ok") is not False:
+            fail(f"a search of an app that was never indexed should exit 3 with "
+                 f"index_not_ready, got {never.returncode} {never.stdout!r} {never.stderr[-400:]}")
+        if (home / "apps" / "never").exists():
+            fail("search created a directory for an app that was never indexed")
+
+        try:
+            _done, started, elapsed = seek.run(
+                "index", "--app", APP, "--schema", NAMED, timeout=INDEX_RETURN_S)
+        except subprocess.TimeoutExpired:
+            fail(f"index did not return within {INDEX_RETURN_S}s")
+        if elapsed >= INDEX_RETURN_S or started.get("ok") is not True or started.get("state") != "building":
+            fail(f"index should return at once with building, got {elapsed:.1f}s {started!r}")
+        app_data_index = home.parent / "lastdb-app-data"
+        if app_data_index.exists():
+            fail("LASTDB_APP_DATA moved the app index")
+        if not str(seek.app_dir).startswith(str(home)):
+            fail(f"the app index is not under LASTSEEK_HOME: {seek.app_dir}")
+
+        ready = wait_ready(seek)
+        if ready.get("records") != 3 or ready.get("schemas") != [NAMED]:
+            fail(f"status should report the three {NAMED} records, got {ready!r}")
+        if not ready.get("applied_through"):
+            fail(f"a ready index should name applied_through, got {ready!r}")
+        print(f"index: {ready['records']} records through {ready['applied_through']}", flush=True)
+
+        state_path = seek.app_dir / "index-state.json"
+        log_path = seek.app_dir / "index.log"
+        before_state = state_path.read_bytes()
+        before_log = log_path.stat().st_size
+        try:
+            _done, again, again_elapsed = seek.run(
+                "index", "--app", APP, "--schema", NAMED, timeout=INDEX_RETURN_S)
+        except subprocess.TimeoutExpired:
+            fail(f"the second index did not return within {INDEX_RETURN_S}s")
+        if again.get("state") != "ready" or again.get("ok") is not True:
+            fail(f"the second index of the same schemas should be ready, got {again!r}")
+        if state_path.read_bytes() != before_state or log_path.stat().st_size != before_log:
+            fail("the second index rebuilt: index-state.json or index.log changed")
+        print(f"index: same schemas stayed ready in {again_elapsed:.1f}s and rebuilt nothing",
+              flush=True)
+
         expect_first(seek, "how do I bake bread at home", "bread")
         expect_first(seek, "fix a flat tyre on my bike", "bike")
-        print(f"rebuild: indexed {built['indexed']['records']} records through {built['applied_through']}", flush=True)
 
         write(node,
               {**record(NAMED, "kite", "Kite flying", "Launch the kite into a steady wind on the beach and let out the string."), "op": "create"},
               {**record(NAMED, "bike", "Telescope", "Point the telescope at Saturn on a clear night to see its rings."),
                "op": "replace", "revision": revision(node, "bike")},
               {"schema": NAMED, "op": "delete", "key": {"hash": "tides"}, "revision": revision(node, "tides")})
-        drained = seek.run("drain", "--lastdb-socket", node, "--max-files", "500")
-        if drained["records"] != 2 or drained["tombstones"] != 1 or drained["has_more"]:
-            fail(f"the drain should apply two records and one deletion, got {drained!r}")
         expect_first(seek, "flying a kite in the wind", "kite")
         expect_first(seek, "looking at planets through a telescope", "bike")
-        if "tides" in seek.keys("tide times at the harbour"):
-            fail("a deleted record still answers a query")
-        print(f"drain: applied {drained['records']} records and {drained['tombstones']} deletion "
-              f"through {drained['applied_through']}", flush=True)
+        if "tides" in seek_keys(seek, "tide times at the harbour"):
+            fail("a deleted record still answers a search")
+        caught_up = wait_ready(seek)
+        if caught_up.get("records") != 3 or caught_up.get("schemas") != [NAMED]:
+            fail(f"after create, replace and delete the index should still hold three "
+                 f"{NAMED} records, got {caught_up!r}")
+        print(f"search: create, replace and delete are visible through {caught_up['applied_through']}",
+              flush=True)
 
     summary = os.environ.get("GITHUB_STEP_SUMMARY")
     if summary:
         with open(summary, "a") as handle:
-            handle.write("LastSeek rebuild, drain and query passed on the node above. "
+            handle.write("LastSeek index, search and status passed on the node above. "
                          "A schema nobody named stayed out of the index.\n")
     print("lastseek node check passed", flush=True)
 

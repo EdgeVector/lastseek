@@ -1,11 +1,37 @@
 # LastSeek
 
-The app that wants search names the schemas to index. LastSeek keeps no list
+An app names itself and the schemas it wants indexed. LastSeek keeps no list
 of its own: a schema no app named is never read and never indexed. Every field
 of a named schema is embedded.
 
 ```sh
-lastseek rebuild --schema brain/Design --schema brain/Decision
+lastseek index  --app brain --schema brain/Design --schema brain/Decision
+lastseek search --app brain "durable compaction"
+lastseek status --app brain
+```
+
+Each of those commands prints one JSON object on stdout. Progress and
+diagnostics go to stderr. The app does not name a directory. The index for
+`NAME` is `$LASTSEEK_HOME/apps/NAME`, or `~/.lastseek/apps/NAME` when
+`LASTSEEK_HOME` is unset. `NAME` is 1–64 characters of `[a-z0-9_-]`. LastSeek
+owns that directory. `LASTDB_APP_DATA` does not move it.
+
+`index` returns immediately. It prints `state` `ready` when the published
+index is already exactly that schema set and does not need a rebuild, and it
+builds nothing. It prints `state` `building` when a build is already running,
+or when it just started one in the background. `--wait` runs that build in
+the foreground and exits non-zero when the build fails. `search` answers from
+a ready index after catching up from the LastDB changes list. It does not
+start a first build: an index that is not ready prints `index_not_ready` and
+exits 3. `status` reports `absent`, `building`, `ready`, `failed`, or
+`rebuild_required`, and exits 0 for every state.
+
+The older commands still work and still take `--home`. `query` reads the
+index in that directory. It does not pick a different directory because the
+schema names start with `brain/`.
+
+```sh
+lastseek rebuild --home DIR --schema brain/Design --schema brain/Decision
 ```
 
 LastSeek lists each schema's primary keys with a `keys_only` `POST /v1/read`
@@ -18,24 +44,22 @@ position (`through`, plus the list `id`) together. The existing
 deletions. A changed list `id` voids the position. A gap, or a changed `id`,
 starts a replacement index while LastDB stays online. A socket failure can be
 retried from the same checkpoint. `lastseek status` reports the list id,
-resumed restarts and completed gap rebuilds for the online store.
+resumed restarts and completed gap rebuilds for the online store. `search`
+does not rebuild inside the command: a gap starts the same background `index`
+and the answer comes from the index already published, with `stale` set.
 
 As a restricted app, LastSeek can read only the schemas on `access.read` in
 `lastdb-app.json`. A request for any other schema is refused by LastDB.
 
-This workflow covers ordinary local writes.
-On a machine where the default index serves other apps too, run
-`lastseek rebuild --home ~/.lastseek/brain-index`. A query naming only
-Brain schemas uses this published index when it covers the entire query.
-Queries with an explicit store or inbox retain that selection. Schedule
-`lastseek drain --home ~/.lastseek/brain-index --max-files 500` alongside
-the default inbox worker. The online drain compacts when its pending log
-reaches the store threshold.
+This workflow covers ordinary local writes. The online drain compacts when
+its pending log reaches the store threshold.
 
-Use `--home DIR --schema brain/Reference` for a separate scoped index.
-The rebuild refuses to replace an index that contains vectors outside its
-scope. Shared peer replay and concurrent schema maintenance are outside this
-workflow because the app change feed does not account for those paths.
+Use `rebuild --home DIR --schema brain/Reference` for a separate scoped index
+outside the app commands. The rebuild refuses to replace an index that
+contains vectors outside its scope. `index --app` is the app naming its whole
+set, so that command may replace a narrower set. Shared peer replay and
+concurrent schema maintenance are outside this workflow because the app
+change feed does not account for those paths.
 
 ### File inbox
 
