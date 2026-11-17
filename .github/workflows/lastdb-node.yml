@@ -1,6 +1,6 @@
-# LastSeek's real commands against a real LastDB node: the newest nightly on a
+# LastSeek's app commands against a real LastDB node: the newest nightly on a
 # fresh home. ci-required builds without the embedding model; this job builds
-# the feature-complete program and runs rebuild, drain and query.
+# the feature-complete program and runs index, search and status.
 name: LastSeek on a LastDB node
 
 on:
@@ -47,7 +47,7 @@ jobs:
       - name: Start the latest LastDB nightly on a fresh home
         id: lastdb
         uses: EdgeVector/.github/lastdb-node@9e14e0a569c77c7e7229ff9b6e00664c597ccabe
-      - name: Rebuild, drain and query through the real commands
+      - name: Index, search and status through the real commands
         run: |
           python3 scripts/ci-lastdb-node.py \
             --lastseek target/release/lastseek \

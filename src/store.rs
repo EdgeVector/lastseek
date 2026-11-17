@@ -384,6 +384,21 @@ fn tighten_private(path: &Path, mode: u32) -> Result<(), LastSeekError> {
 /// over `path`. `std::fs::write` would create the file at the umask. Shared
 /// with the sidecars other modules keep under the store root (the drain
 /// watermark) so every file there goes through one writer.
+/// Create `path` and any missing parent as an owner-only directory.
+pub fn ensure_private_dir(path: &Path) -> Result<(), LastSeekError> {
+    create_private_dir_all(path)
+}
+
+/// Write `bytes` to `path` atomically, creating parent directories owner-only.
+pub fn write_private_file(path: &Path, bytes: &[u8]) -> Result<(), LastSeekError> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            create_private_dir_all(parent)?;
+        }
+    }
+    write_private_atomic(path, bytes)
+}
+
 pub(crate) fn write_private_atomic(path: &Path, bytes: &[u8]) -> Result<(), LastSeekError> {
     let mut tmp = path.as_os_str().to_owned();
     tmp.push(".lastseek-tmp");

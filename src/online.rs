@@ -109,6 +109,31 @@ impl Checkpoint {
         }
     }
 
+    /// Schema names this index was built from, in order.
+    pub fn names(&self) -> &[String] {
+        &self.names
+    }
+
+    /// True when `schemas` is the same set this index was built from.
+    ///
+    /// Order and repeated names do not matter. A superset or a subset does
+    /// not match: the app named the whole set.
+    pub fn same_schemas(&self, schemas: &[String]) -> bool {
+        let have: BTreeSet<&str> = self.names.iter().map(String::as_str).collect();
+        let want: BTreeSet<&str> = schemas.iter().map(String::as_str).collect();
+        have == want
+    }
+
+    /// True when `schema` is one of the names the index was built from, or
+    /// the identity those names resolved to.
+    pub fn holds(&self, schema: &str) -> bool {
+        self.names.iter().any(|name| name == schema)
+            || self
+                .projections
+                .values()
+                .any(|projection| projection.identity == schema)
+    }
+
     fn save(&self, dir: &Path) -> Result<(), LastSeekError> {
         write_private_atomic(&dir.join(STATE), &serde_json::to_vec(self)?)?;
         sync_dir(dir)
@@ -140,6 +165,81 @@ fn lock(root: &Path, name: &str, exclusive: bool) -> Result<File, LastSeekError>
 
 pub fn lock_updates(root: &Path) -> Result<File, LastSeekError> {
     lock(root, "updates.lock", true)
+}
+
+fn lock_contended(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::WouldBlock
+}
+
+/// Take the update lock when nobody else holds it.
+///
+/// `None` means another process holds it, or this root has no online index
+/// yet. The caller then skips the catch-up instead of waiting.
+pub fn try_lock_updates(root: &Path) -> Result<Option<File>, LastSeekError> {
+    let control = root.join(ONLINE);
+    if !control.is_dir() {
+        return Ok(None);
+    }
+    let file = private_open_options()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(control.join("updates.lock"))?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => Ok(Some(file)),
+        Err(error) if lock_contended(&error) => Ok(None),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// Exclusive lock held for the whole of an app-interface build.
+///
+/// This is not `rebuild.lock`. `rebuild` takes that itself, and a status
+/// check has to be able to see that a build is in progress without taking
+/// the rebuild lock or waiting on it.
+pub fn lock_build(root: &Path) -> Result<File, LastSeekError> {
+    lock(root, "build.lock", true)
+}
+
+/// True while a build holds `build.lock`.
+///
+/// A missing lock file means no build has started. Taking the lock and
+/// releasing it is how a dead build is told apart from a live one: the file
+/// can still say `building` after the process is gone.
+pub fn build_running(root: &Path) -> Result<bool, LastSeekError> {
+    let path = root.join(ONLINE).join("build.lock");
+    if !path.exists() {
+        return Ok(false);
+    }
+    let file = private_open_options().read(true).write(true).open(&path)?;
+    match fs2::FileExt::try_lock_exclusive(&file) {
+        Ok(()) => {
+            fs2::FileExt::unlock(&file)?;
+            Ok(false)
+        }
+        Err(error) if lock_contended(&error) => Ok(true),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The published slot, without creating directories or taking a lock.
+pub struct Published {
+    pub dir: PathBuf,
+    pub checkpoint: Checkpoint,
+}
+
+pub fn published(root: &Path) -> Result<Option<Published>, LastSeekError> {
+    let Some(slot) = active(root)? else {
+        return Ok(None);
+    };
+    let dir = root.join(ONLINE).join(slot);
+    let checkpoint = read_checkpoint(&dir)?;
+    Ok(Some(Published { dir, checkpoint }))
+}
+
+pub fn read_checkpoint(dir: &Path) -> Result<Checkpoint, LastSeekError> {
+    Ok(serde_json::from_slice(&fs::read(dir.join(STATE))?)?)
 }
 
 fn active(root: &Path) -> Result<Option<&'static str>, LastSeekError> {
@@ -319,6 +419,16 @@ fn within_budget(started: Instant) -> Result<(), LastSeekError> {
     Ok(())
 }
 
+/// What the caller is allowed to do to the schema set already published.
+enum PreviousScope<'a> {
+    /// `lastseek rebuild`. Refuse to drop a schema from a shared home.
+    Preserve,
+    /// Gap recovery. The schema set has to be the one already published.
+    Recover(&'a BTreeMap<String, Projection>),
+    /// `lastseek index`. The app named the whole set, including a smaller one.
+    Replace,
+}
+
 pub fn rebuild(
     root: &Path,
     socket: &Path,
@@ -331,7 +441,44 @@ pub fn rebuild(
         .checkpoint
         .map(|state| state.recovery)
         .unwrap_or_default();
-    rebuild_locked(root, socket, names, table, embedder, recovery, None)
+    rebuild_locked(
+        root,
+        socket,
+        names,
+        table,
+        embedder,
+        recovery,
+        PreviousScope::Preserve,
+    )
+}
+
+/// Rebuild the index an app owns, replacing its schema set when the app
+/// named a different one.
+///
+/// `rebuild` refuses to drop a schema so one shared `--home` cannot be
+/// narrowed by accident. An app directory belongs to one app, and `index`
+/// is that app naming the whole set.
+pub fn rebuild_app(
+    root: &Path,
+    socket: &Path,
+    names: &[String],
+    table: &SchemaTable,
+    embedder: &mut dyn Embedder,
+) -> Result<Value, LastSeekError> {
+    let _rebuild = lock(root, "rebuild.lock", true)?;
+    let recovery = select(root)?
+        .checkpoint
+        .map(|state| state.recovery)
+        .unwrap_or_default();
+    rebuild_locked(
+        root,
+        socket,
+        names,
+        table,
+        embedder,
+        recovery,
+        PreviousScope::Replace,
+    )
 }
 
 pub fn recover(
@@ -358,7 +505,7 @@ pub fn recover(
         table,
         embedder,
         state.recovery,
-        Some(&state.projections),
+        PreviousScope::Recover(&state.projections),
     )
 }
 
@@ -369,15 +516,23 @@ fn rebuild_locked(
     table: &SchemaTable,
     embedder: &mut dyn Embedder,
     mut recovery: Recovery,
-    previous_projections: Option<&BTreeMap<String, Projection>>,
+    scope: PreviousScope<'_>,
 ) -> Result<Value, LastSeekError> {
     let started = Instant::now();
     let source = Source(socket);
     let projections = search_catalog::projections(names, table)?;
+    let previous_projections = match scope {
+        PreviousScope::Recover(previous) => Some(previous),
+        PreviousScope::Preserve | PreviousScope::Replace => None,
+    };
     if previous_projections.is_some_and(|previous| *previous != projections) {
         return Err(invalid("indexed schemas changed; run lastseek rebuild"));
     }
-    require_scope(&select(root)?.dir, &projections)?;
+    // A shared `--home` must not lose a schema because a later rebuild named
+    // fewer of them. An app index may: `index --schema` is the whole set.
+    if !matches!(scope, PreviousScope::Replace) {
+        require_scope(&select(root)?.dir, &projections)?;
+    }
     let schema_names: Vec<String> = projections.keys().cloned().collect();
     // Head only. `after: 0` sets gap once retention has trimmed the list, and
     // that gap does not remove the current head.
@@ -482,7 +637,9 @@ fn rebuild_locked(
     sync_dir(&control)?;
     let _selection = lock(root, "selection.lock", true)?;
     let current = active(root)?.map_or_else(|| root.to_owned(), |slot| control.join(slot));
-    require_scope(&current, &checkpoint.projections)?;
+    if !matches!(scope, PreviousScope::Replace) {
+        require_scope(&current, &checkpoint.projections)?;
+    }
     write_private_atomic(&control.join(ACTIVE), slot.as_bytes())?;
     sync_dir(&control)?;
     sync_dir(root)?;
