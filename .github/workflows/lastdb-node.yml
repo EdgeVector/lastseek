@@ -46,7 +46,7 @@ jobs:
         run: cargo build --locked --release --features neural
       - name: Start the latest LastDB nightly on a fresh home
         id: lastdb
-        uses: EdgeVector/.github/lastdb-node@868977ec58c80b6ea1360d161d1492d2e97f061c
+        uses: EdgeVector/.github/lastdb-node@338b9228085eea3e5c11c300ea762f1f081a8608
       - name: Rebuild, drain and query through the real commands
         run: |
           python3 scripts/ci-lastdb-node.py \
